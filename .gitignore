@@ -1,0 +1,6 @@
+*.csv
+anki_workspace/media/**
+anki_workspace/exports/**
+**/__pycache__/**
+**.apkg
+**.env
