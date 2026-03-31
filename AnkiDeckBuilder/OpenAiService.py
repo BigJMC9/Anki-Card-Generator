@@ -9,6 +9,13 @@ from openai import OpenAI
 from AnkiDeckBuilder.AppConfig import CardSchemas, ImageOcrPrompt, SystemPrompt
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
+SupportedWordForms = {
+    "dictionary": "dictionary/plain form",
+    "masu": "polite masu form",
+    "past": "past tense",
+    "te": "te-form",
+    "future": "future expression",
+}
 
 
 def GetOpenAiClient() -> OpenAI:
@@ -198,11 +205,14 @@ def ExtractCardsFromImages(
     uploads,
     schemaKey: str,
     extraTags: List[str],
+    wordForm: str = "dictionary",
     progressCallback: ProgressCallback = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
     totalUploads = len(uploads)
+
+    targetFormLabel = SupportedWordForms.get(wordForm, SupportedWordForms["dictionary"])
 
     for uploadIndex, upload in enumerate(uploads, start=1):
         if progressCallback:
@@ -218,6 +228,13 @@ def ExtractCardsFromImages(
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": "Extract Japanese text and build vocabulary candidates."},
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "When possible, normalize verbs/adjectives in kanji and kana to "
+                                    f"{targetFormLabel}."
+                                ),
+                            },
                             {"type": "input_image", "image_url": FileToDataUrl(upload)},
                         ],
                     },
@@ -245,3 +262,130 @@ def ExtractCardsFromImages(
                 progressCallback(uploadIndex, totalUploads, f"Scanned {upload.name} ({uploadIndex}/{totalUploads})")
 
     return results, errors
+
+
+def ConvertJapaneseWords(
+    client: OpenAI,
+    model: str,
+    cards: List[Dict[str, Any]],
+    targetForm: str,
+    progressCallback: ProgressCallback = None,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    conversions: List[Dict[str, str]] = []
+    errors: List[str] = []
+    if not cards:
+        return conversions, errors
+
+    targetFormLabel = SupportedWordForms.get(targetForm, SupportedWordForms["dictionary"])
+    payloadItems = [
+        {
+            "id": card["id"],
+            "kanji": card.get("kanji", ""),
+            "kana": card.get("kana", ""),
+        }
+        for card in cards
+    ]
+
+    if progressCallback:
+        progressCallback(0, 1, f"Converting selected cards to {targetFormLabel}...")
+
+    try:
+        raw = RequestResponseText(
+            client,
+            model,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You transform Japanese words into requested forms. Return only valid JSON in schema "
+                        '{"items":[{"id":"","kanji":"","kana":""}]}. Keep id unchanged. '
+                        "If a field cannot be transformed, keep the original value."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "target_form": targetFormLabel,
+                            "items": payloadItems,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        )
+        parsed = ParseJsonResponse(raw)
+        for item in parsed.get("items", []):
+            itemId = (item.get("id") or "").strip()
+            if not itemId:
+                continue
+            conversions.append(
+                {
+                    "id": itemId,
+                    "kanji": (item.get("kanji") or "").strip(),
+                    "kana": (item.get("kana") or "").strip(),
+                }
+            )
+    except Exception as exc:
+        errors.append(str(exc))
+    finally:
+        if progressCallback:
+            progressCallback(1, 1, f"Converted selected cards to {targetFormLabel}.")
+
+    return conversions, errors
+
+
+def GenerateEnglishTranslations(
+    client: OpenAI,
+    model: str,
+    cards: List[Dict[str, Any]],
+    progressCallback: ProgressCallback = None,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    translations: List[Dict[str, str]] = []
+    errors: List[str] = []
+    if not cards:
+        return translations, errors
+
+    payloadItems = [
+        {
+            "id": card["id"],
+            "kanji": card.get("kanji", ""),
+            "kana": card.get("kana", ""),
+            "source_text": card.get("source_text", ""),
+            "notes": card.get("notes", ""),
+        }
+        for card in cards
+    ]
+
+    if progressCallback:
+        progressCallback(0, 1, "Generating missing English translations...")
+
+    try:
+        raw = RequestResponseText(
+            client,
+            model,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate concise English translations for Japanese vocabulary cards. "
+                        'Return only valid JSON in schema {"items":[{"id":"","english":""}]}. '
+                        "Keep id unchanged and keep english short."
+                    ),
+                },
+                {"role": "user", "content": json.dumps({"items": payloadItems}, ensure_ascii=False)},
+            ],
+        )
+        parsed = ParseJsonResponse(raw)
+        for item in parsed.get("items", []):
+            itemId = (item.get("id") or "").strip()
+            english = (item.get("english") or "").strip()
+            if itemId and english:
+                translations.append({"id": itemId, "english": english})
+    except Exception as exc:
+        errors.append(str(exc))
+    finally:
+        if progressCallback:
+            progressCallback(1, 1, "Generated missing English translations.")
+
+    return translations, errors
