@@ -11,36 +11,17 @@ class PageDefinition:
 
 
 PageDefinitions: List[PageDefinition] = [
-    PageDefinition("Dashboard", "Dashboard", "Deck and card totals across your workspace.", "Overview"),
-    PageDefinition(
-        "Dictionary",
-        "Dictionary",
-        "Search jamdict entries and review their details.",
-        "Overview",
-    ),
-    PageDefinition("Cards", "Cards", "Manage global/deck cards, deck structure, and OCR scans.", "Workspace"),
-    PageDefinition("AddCards", "Add Cards", "Add dictionary cards or custom cards to global pool/decks.", "Workspace"),
-    PageDefinition(
-        "ImportCsv",
-        "Import CSV",
-        "Bulk import cards from a CSV file.",
-        "Maintain",
-    ),
-    PageDefinition(
-        "ExportDeck",
-        "Export Deck",
-        "Build and download Anki .apkg deck packages.",
-        "Maintain",
-    ),
+    PageDefinition("Dictionary", "Dictionary", "Search, inspect, and add Japanese cards from dictionary entries.", "Overview"),
+    PageDefinition("Cards", "Cards", "Manage cards, decks, media replacement, scan, and imports/exports in one workspace.", "Overview"),
 ]
 
 PageOrder = [page.Key for page in PageDefinitions]
 PageByKey: Dict[str, PageDefinition] = {page.Key: page for page in PageDefinitions}
-SectionOrder = ["Overview", "Workspace", "Maintain"]
+SectionOrder = ["Overview"]
 
 
 def GetDefaultPageKey() -> str:
-    return "Dashboard"
+    return "Dictionary"
 
 
 def GetPageDefinition(pageKey: str) -> PageDefinition:

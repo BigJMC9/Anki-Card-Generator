@@ -209,6 +209,129 @@ def ExtractPosLabels(rawEntry: Any, maxItems: int = 8) -> List[str]:
     return labels
 
 
+def ExtractSenseRows(rawEntry: Any, maxSenses: int = 8, maxGlosses: int = 6) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for sense in getattr(rawEntry, "senses", []) or []:
+        glosses: List[str] = []
+        for gloss in getattr(sense, "gloss", []) or []:
+            text = str(gloss).strip()
+            if not text or text in glosses:
+                continue
+            glosses.append(text)
+            if len(glosses) >= maxGlosses:
+                break
+
+        posLabels: List[str] = []
+        for pos in getattr(sense, "pos", []) or []:
+            text = str(pos).strip()
+            if not text or text in posLabels:
+                continue
+            posLabels.append(text)
+
+        notes: List[str] = []
+        for attributeName in ("misc", "info", "field", "dial"):
+            for value in getattr(sense, attributeName, []) or []:
+                text = str(value).strip()
+                if not text or text in notes:
+                    continue
+                notes.append(text)
+
+        if not glosses and not posLabels and not notes:
+            continue
+
+        rows.append(
+            {
+                "sense_index": len(rows) + 1,
+                "glosses": glosses,
+                "pos_labels": posLabels,
+                "notes": notes,
+            }
+        )
+        if len(rows) >= maxSenses:
+            break
+
+    return rows
+
+
+def ExtractExampleSentences(rawEntry: Any, maxItems: int = 8) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    seen = set()
+    for sense in getattr(rawEntry, "senses", []) or []:
+        rawExamples: List[Any] = []
+        for attributeName in ("examples", "example", "sentences"):
+            value = getattr(sense, attributeName, None)
+            if not value:
+                continue
+            if isinstance(value, list):
+                rawExamples.extend(value)
+            else:
+                rawExamples.append(value)
+
+        for rawExample in rawExamples:
+            japanese = ""
+            reading = ""
+            english = ""
+
+            if isinstance(rawExample, str):
+                japanese = rawExample.strip()
+            elif isinstance(rawExample, dict):
+                japanese = str(
+                    rawExample.get("japanese")
+                    or rawExample.get("text")
+                    or rawExample.get("sentence")
+                    or rawExample.get("ja")
+                    or rawExample.get("jpn")
+                    or ""
+                ).strip()
+                reading = str(rawExample.get("reading") or rawExample.get("kana") or "").strip()
+                english = str(
+                    rawExample.get("english")
+                    or rawExample.get("translation")
+                    or rawExample.get("en")
+                    or ""
+                ).strip()
+            else:
+                japanese = str(
+                    getattr(rawExample, "japanese", None)
+                    or getattr(rawExample, "text", None)
+                    or getattr(rawExample, "sentence", None)
+                    or getattr(rawExample, "ja", None)
+                    or getattr(rawExample, "jpn", None)
+                    or ""
+                ).strip()
+                reading = str(
+                    getattr(rawExample, "reading", None)
+                    or getattr(rawExample, "kana", None)
+                    or ""
+                ).strip()
+                english = str(
+                    getattr(rawExample, "english", None)
+                    or getattr(rawExample, "translation", None)
+                    or getattr(rawExample, "en", None)
+                    or ""
+                ).strip()
+
+            if not japanese and not english:
+                continue
+
+            dedupeKey = (japanese, reading, english)
+            if dedupeKey in seen:
+                continue
+            seen.add(dedupeKey)
+
+            rows.append(
+                {
+                    "japanese": japanese,
+                    "reading": reading,
+                    "english": english,
+                }
+            )
+            if len(rows) >= maxItems:
+                return rows
+
+    return rows
+
+
 def DetectVerbType(posLabels: List[str]) -> str:
     normalized = " | ".join(posLabels).lower()
     if "kuru verb" in normalized:
@@ -244,6 +367,8 @@ def NormalizeDictionaryEntry(rawEntry: Any) -> Dict[str, Any]:
     posLabels = ExtractPosLabels(rawEntry)
     glosses = ExtractGlosses(rawEntry)
     verbType = DetectVerbType(posLabels)
+    senses = ExtractSenseRows(rawEntry)
+    examples = ExtractExampleSentences(rawEntry)
 
     headword = kanjiForms[0] if kanjiForms else (kanaForms[0] if kanaForms else "")
     reading = kanaForms[0] if kanaForms else headword
@@ -266,6 +391,8 @@ def NormalizeDictionaryEntry(rawEntry: Any) -> Dict[str, Any]:
         "reading": reading,
         "english": english,
         "glosses": glosses,
+        "senses": senses,
+        "examples": examples,
         "pos_labels": posLabels,
         "kanji_forms": kanjiForms,
         "kana_forms": kanaForms,

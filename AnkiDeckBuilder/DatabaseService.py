@@ -980,6 +980,19 @@ def DeleteCardsByIds(connection: sqlite3.Connection, deckId: str, cardIds: List[
     return max(cursor.rowcount, 0)
 
 
+def DeleteGlobalCardsByIds(connection: sqlite3.Connection, globalCardIds: List[str]) -> int:
+    if not globalCardIds:
+        return 0
+
+    placeholders = ", ".join(["?"] * len(globalCardIds))
+    cursor = connection.execute(
+        f"DELETE FROM global_cards WHERE id IN ({placeholders})",
+        list(globalCardIds),
+    )
+    connection.commit()
+    return max(cursor.rowcount, 0)
+
+
 def DeckNameToId(connection: sqlite3.Connection, collectionName: str, deckName: str) -> Optional[str]:
     row = connection.execute(
         """

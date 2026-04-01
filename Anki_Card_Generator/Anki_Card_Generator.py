@@ -26,6 +26,7 @@ from AnkiDeckBuilder.DatabaseService import (
     DeckHasCandidate,
     DeckHasKanjiWordForm,
     DeleteCardsByIds,
+    DeleteGlobalCardsByIds,
     GetDashboardRows,
     GetDeckCards,
     GetTotalCardCount,
@@ -132,6 +133,22 @@ CardSchemaOptionRows = [{"key": key, "label": definition["Label"]} for key, defi
 VerbFormOptionRows = [{"key": key, "label": label} for key, label in VerbFormLabels.items()]
 AddDestinationOptions = [{"key": "global", "label": "Global pool"}, {"key": "deck", "label": "Deck"}]
 CardsScopeOptions = [{"key": "global", "label": "Global pool"}, {"key": "deck", "label": "Deck cards"}]
+ContextScopeOptions = [{"key": "global", "label": "Global Pool"}, {"key": "deck", "label": "Collection -> Deck"}]
+InlineCardTypeOptions = [
+    {"key": "recognition", "label": "Recognition"},
+    {"key": "production", "label": "Production"},
+    {"key": "sentence", "label": "Sentence-based"},
+]
+InlineWordKindOptions = [
+    {"key": "noun", "label": "Noun"},
+    {"key": "i_adj", "label": "I-adjective"},
+    {"key": "na_adj", "label": "Na-adjective"},
+    {"key": "ichidan", "label": VerbTypeLabels.get("ichidan", "Ichidan")},
+    {"key": "godan", "label": VerbTypeLabels.get("godan", "Godan")},
+    {"key": "suru", "label": VerbTypeLabels.get("suru", "Suru irregular")},
+    {"key": "suru_noun", "label": VerbTypeLabels.get("suru_noun", "Suru noun")},
+    {"key": "kuru", "label": VerbTypeLabels.get("kuru", "Kuru irregular")},
+]
 VerbTypeOptionRows = [
     {"key": "other", "label": "Noun / Other"},
     {"key": "ichidan", "label": VerbTypeLabels.get("ichidan", "Ichidan")},
@@ -151,6 +168,143 @@ ReviewMediaTypeOptions = [
     {"key": "audio", "label": "Audio"},
     {"key": "video", "label": "Video"},
 ]
+ExtendedVerbFormLabels = {
+    "dictionary": "Dictionary form",
+    "masu": "Masu form",
+    "te": "Te form",
+    "past": "Ta form",
+    "negative": "Nai form",
+    "potential": "Potential",
+    "passive": "Passive",
+    "causative": "Causative",
+}
+GodanERowMap = {
+    "う": "え",
+    "く": "け",
+    "ぐ": "げ",
+    "す": "せ",
+    "つ": "て",
+    "ぬ": "ね",
+    "ぶ": "べ",
+    "む": "め",
+    "る": "れ",
+}
+GodanARowMap = {
+    "う": "わ",
+    "く": "か",
+    "ぐ": "が",
+    "す": "さ",
+    "つ": "た",
+    "ぬ": "な",
+    "ぶ": "ば",
+    "む": "ま",
+    "る": "ら",
+}
+
+
+def DetectInlineWordKind(entry: Dict[str, Any]) -> str:
+    verbType = (entry.get("verb_type") or "other").strip()
+    if verbType in {"ichidan", "godan", "suru", "suru_noun", "kuru"}:
+        return verbType
+
+    posText = " | ".join(entry.get("pos_labels", []) or []).lower()
+    if "adjective (keiyoushi)" in posText or "i-adjective" in posText:
+        return "i_adj"
+    if "adjectival nouns" in posText or "na-adjective" in posText:
+        return "na_adj"
+    return "noun"
+
+
+def BuildExtendedVerbForms(entry: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    payload = BuildGlobalCardFromDictionaryEntry(entry)
+    forms = {
+        "dictionary": {"word": payload.get("kanji", ""), "reading": payload.get("kana", "")},
+        "masu": {"word": payload.get("kanji_masu", ""), "reading": payload.get("kana_masu", "")},
+        "te": {"word": payload.get("kanji_te", ""), "reading": payload.get("kana_te", "")},
+        "past": {"word": payload.get("kanji_past", ""), "reading": payload.get("kana_past", "")},
+        "negative": {"word": payload.get("kanji_negative", ""), "reading": payload.get("kana_negative", "")},
+        "potential": {"word": "", "reading": ""},
+        "passive": {"word": "", "reading": ""},
+        "causative": {"word": "", "reading": ""},
+    }
+
+    dictionaryWord = (forms["dictionary"]["word"] or "").strip()
+    dictionaryReading = (forms["dictionary"]["reading"] or "").strip()
+    verbType = (entry.get("verb_type") or "other").strip()
+
+    if not dictionaryReading or verbType == "other":
+        return forms
+
+    if verbType == "ichidan":
+        if dictionaryReading.endswith("る"):
+            stemReading = dictionaryReading[:-1]
+            stemWord = dictionaryWord[:-1] if dictionaryWord.endswith("る") else dictionaryWord
+            forms["potential"] = {"word": f"{stemWord}られる", "reading": f"{stemReading}られる"}
+            forms["passive"] = {"word": f"{stemWord}られる", "reading": f"{stemReading}られる"}
+            forms["causative"] = {"word": f"{stemWord}させる", "reading": f"{stemReading}させる"}
+        return forms
+
+    if verbType in {"suru", "suru_noun"}:
+        baseWord = dictionaryWord[:-2] if dictionaryWord.endswith("する") else dictionaryWord
+        baseReading = dictionaryReading[:-2] if dictionaryReading.endswith("する") else dictionaryReading
+        forms["potential"] = {"word": f"{baseWord}できる", "reading": f"{baseReading}できる"}
+        forms["passive"] = {"word": f"{baseWord}される", "reading": f"{baseReading}される"}
+        forms["causative"] = {"word": f"{baseWord}させる", "reading": f"{baseReading}させる"}
+        return forms
+
+    if verbType == "kuru":
+        if dictionaryWord.endswith("来る"):
+            baseWord = dictionaryWord[:-2]
+            forms["potential"] = {"word": f"{baseWord}来られる", "reading": "こられる"}
+            forms["passive"] = {"word": f"{baseWord}来られる", "reading": "こられる"}
+            forms["causative"] = {"word": f"{baseWord}来させる", "reading": "こさせる"}
+        else:
+            forms["potential"] = {"word": "こられる", "reading": "こられる"}
+            forms["passive"] = {"word": "こられる", "reading": "こられる"}
+            forms["causative"] = {"word": "こさせる", "reading": "こさせる"}
+        return forms
+
+    if verbType == "godan":
+        ending = dictionaryReading[-1]
+        stemReading = dictionaryReading[:-1]
+        stemWord = dictionaryWord[:-1] if dictionaryWord else dictionaryWord
+        eRow = GodanERowMap.get(ending)
+        aRow = GodanARowMap.get(ending)
+        if eRow:
+            forms["potential"] = {"word": f"{stemWord}{eRow}る", "reading": f"{stemReading}{eRow}る"}
+        if aRow:
+            forms["passive"] = {"word": f"{stemWord}{aRow}れる", "reading": f"{stemReading}{aRow}れる"}
+            forms["causative"] = {"word": f"{stemWord}{aRow}せる", "reading": f"{stemReading}{aRow}せる"}
+    return forms
+
+
+def BuildIAdjectiveForms(word: str, reading: str) -> Dict[str, Dict[str, str]]:
+    normalizedWord = (word or "").strip()
+    normalizedReading = (reading or "").strip()
+    forms = {
+        "dictionary": {"word": normalizedWord, "reading": normalizedReading},
+        "past": {"word": normalizedWord, "reading": normalizedReading},
+        "negative": {"word": normalizedWord, "reading": normalizedReading},
+    }
+    if normalizedReading.endswith("い"):
+        readingStem = normalizedReading[:-1]
+        forms["past"]["reading"] = f"{readingStem}かった"
+        forms["negative"]["reading"] = f"{readingStem}くない"
+    if normalizedWord.endswith("い"):
+        wordStem = normalizedWord[:-1]
+        forms["past"]["word"] = f"{wordStem}かった"
+        forms["negative"]["word"] = f"{wordStem}くない"
+    return forms
+
+
+def BuildNaAdjectiveForms(word: str, reading: str) -> Dict[str, Dict[str, str]]:
+    normalizedWord = (word or "").strip()
+    normalizedReading = (reading or "").strip()
+    return {
+        "dictionary": {"word": normalizedWord, "reading": normalizedReading},
+        "past": {"word": f"{normalizedWord}だった", "reading": f"{normalizedReading}だった"},
+        "negative": {"word": f"{normalizedWord}ではない", "reading": f"{normalizedReading}ではない"},
+    }
 
 
 class AnkiAppState(rx.State):
@@ -158,6 +312,10 @@ class AnkiAppState(rx.State):
     busy_action_name: str = ""
     status_level: str = "info"
     status_message: str = ""
+    app_search_query: str = ""
+    selected_dictionary_entry_id: str = ""
+    context_scope: str = "global"
+    context_deck_id: str = ""
 
     new_collection_name: str = ""
     rename_collection_id: str = ""
@@ -183,6 +341,7 @@ class AnkiAppState(rx.State):
     dictionary_results: List[Dict[str, Any]] = []
 
     cards_scope: str = "global"
+    cards_filter_text: str = ""
 
     global_autofill_query: str = ""
     global_autofill_results: List[Dict[str, Any]] = []
@@ -253,6 +412,44 @@ class AnkiAppState(rx.State):
     export_deck_id: str = ""
     last_export_path: str = ""
 
+    inline_add_open: bool = False
+    inline_add_source: str = "manual"
+    inline_add_destination: str = "global"
+    inline_add_deck_id: str = ""
+    inline_add_card_type: str = "recognition"
+    inline_add_schema_key: str = "kana_kanji_front_english_back"
+    inline_add_word_form: str = "dictionary"
+    inline_add_word_kind: str = "noun"
+    inline_add_word_kind_override: bool = False
+    inline_add_word: str = ""
+    inline_add_reading: str = ""
+    inline_add_meaning: str = ""
+    inline_add_sentence: str = ""
+    inline_add_notes: str = ""
+    inline_add_tags: str = "japanese,manual"
+    inline_add_dictionary_entry_id: str = ""
+    inline_add_dictionary_headword: str = ""
+    inline_add_dictionary_reading: str = ""
+    inline_add_dictionary_gloss: str = ""
+    inline_add_dictionary_pos: str = ""
+    inline_add_verb_type: str = ""
+    inline_add_form_dictionary_word: str = ""
+    inline_add_form_dictionary_reading: str = ""
+    inline_add_form_masu_word: str = ""
+    inline_add_form_masu_reading: str = ""
+    inline_add_form_te_word: str = ""
+    inline_add_form_te_reading: str = ""
+    inline_add_form_past_word: str = ""
+    inline_add_form_past_reading: str = ""
+    inline_add_form_negative_word: str = ""
+    inline_add_form_negative_reading: str = ""
+    inline_add_form_potential_word: str = ""
+    inline_add_form_potential_reading: str = ""
+    inline_add_form_passive_word: str = ""
+    inline_add_form_passive_reading: str = ""
+    inline_add_form_causative_word: str = ""
+    inline_add_form_causative_reading: str = ""
+
     @rx.var
     def is_busy(self) -> bool:
         return bool(self.busy_action_name)
@@ -294,6 +491,22 @@ class AnkiAppState(rx.State):
             if page.Key == self.current_page_key:
                 return page.Description
         return PageDefinitions[0].Description
+
+    @rx.var
+    def selected_context_deck_label(self) -> str:
+        return self._deck_label_by_id(self.context_deck_id)
+
+    @rx.var
+    def current_context_label(self) -> str:
+        if self.context_scope == "global" or not self.context_deck_id:
+            return "Global Pool"
+        return self.selected_context_deck_label or "Collection -> Deck"
+
+    @rx.var
+    def context_summary_text(self) -> str:
+        if self.context_scope == "global":
+            return "Current target: Global Pool"
+        return f"Current target: {self.current_context_label}"
 
     @rx.var(cache=False)
     def collection_options(self) -> List[Dict[str, str]]:
@@ -405,6 +618,10 @@ class AnkiAppState(rx.State):
         return self._deck_label_by_id(self.export_deck_id)
 
     @rx.var
+    def selected_inline_add_deck_label(self) -> str:
+        return self._deck_label_by_id(self.inline_add_deck_id)
+
+    @rx.var
     def add_cards_result_rows(self) -> List[Dict[str, Any]]:
         selectedIds = set(self.add_cards_selected_entry_ids)
         rows: List[Dict[str, Any]] = []
@@ -436,10 +653,17 @@ class AnkiAppState(rx.State):
             entryId = str(entry.get("entry_id", "") or "")
             if not entryId:
                 continue
+            glosses = entry.get("glosses", []) or []
+            meaningPreview = "; ".join(glosses[:2]) if glosses else (entry.get("english", "") or "")
             rows.append(
                 {
                     "entry_id": entryId,
                     "label": FormatDictionaryEntryOption(entry),
+                    "kanji": entry.get("headword", ""),
+                    "reading": entry.get("reading", ""),
+                    "meaning_preview": meaningPreview,
+                    "pos_preview": ", ".join((entry.get("pos_labels", []) or [])[:2]),
+                    "selected": entryId == self.selected_dictionary_entry_id,
                     "json_text": json.dumps(entry, ensure_ascii=False, indent=2),
                 }
             )
@@ -448,6 +672,127 @@ class AnkiAppState(rx.State):
     @rx.var
     def has_dictionary_results(self) -> bool:
         return bool(self.dictionary_result_rows)
+
+    @rx.var
+    def has_selected_dictionary_entry(self) -> bool:
+        return bool(self.selected_dictionary_entry_id and self.selected_dictionary_entry)
+
+    @rx.var
+    def selected_dictionary_entry(self) -> Dict[str, Any]:
+        for entry in self.dictionary_results:
+            entryId = str(entry.get("entry_id", "") or "")
+            if entryId and entryId == self.selected_dictionary_entry_id:
+                return entry
+        if self.dictionary_results:
+            return self.dictionary_results[0]
+        return {}
+
+    @rx.var
+    def selected_dictionary_headword(self) -> str:
+        return (self.selected_dictionary_entry.get("headword", "") or "").strip()
+
+    @rx.var
+    def selected_dictionary_reading(self) -> str:
+        return (self.selected_dictionary_entry.get("reading", "") or "").strip()
+
+    @rx.var
+    def selected_dictionary_pos_text(self) -> str:
+        return ", ".join(self.selected_dictionary_entry.get("pos_labels", []) or [])
+
+    @rx.var
+    def selected_dictionary_sense_rows(self) -> List[Dict[str, Any]]:
+        entry = self.selected_dictionary_entry
+        if not entry:
+            return []
+        rows = entry.get("senses", []) or []
+        if rows:
+            normalizedRows: List[Dict[str, Any]] = []
+            for row in rows:
+                normalizedRows.append(
+                    {
+                        "sense_index": row.get("sense_index", 0),
+                        "glosses": row.get("glosses", []),
+                        "pos_labels": row.get("pos_labels", []),
+                        "notes": row.get("notes", []),
+                        "gloss_text": "; ".join(row.get("glosses", []) or []),
+                        "pos_text": ", ".join(row.get("pos_labels", []) or []),
+                        "notes_text": ", ".join(row.get("notes", []) or []),
+                    }
+                )
+            return normalizedRows
+        fallbackRows: List[Dict[str, Any]] = []
+        for index, gloss in enumerate(entry.get("glosses", []) or [], start=1):
+            fallbackRows.append(
+                {
+                    "sense_index": index,
+                    "glosses": [gloss],
+                    "pos_labels": entry.get("pos_labels", []) or [],
+                    "notes": [],
+                    "gloss_text": gloss,
+                    "pos_text": ", ".join(entry.get("pos_labels", []) or []),
+                    "notes_text": "",
+                }
+            )
+        return fallbackRows
+
+    @rx.var
+    def selected_dictionary_example_rows(self) -> List[Dict[str, str]]:
+        entry = self.selected_dictionary_entry
+        if not entry:
+            return []
+        examples = entry.get("examples", []) or []
+        return examples
+
+    @rx.var
+    def has_selected_dictionary_examples(self) -> bool:
+        return bool(self.selected_dictionary_example_rows)
+
+    @rx.var
+    def selected_dictionary_conjugation_rows(self) -> List[Dict[str, str]]:
+        entry = self.selected_dictionary_entry
+        if not entry:
+            return []
+        wordKind = DetectInlineWordKind(entry)
+        if wordKind in {"ichidan", "godan", "suru", "suru_noun", "kuru"}:
+            forms = BuildExtendedVerbForms(entry)
+            rows: List[Dict[str, str]] = []
+            for key in ("dictionary", "masu", "te", "past", "negative", "potential", "passive", "causative"):
+                value = forms.get(key, {"word": "", "reading": ""})
+                rows.append(
+                    {
+                        "label": ExtendedVerbFormLabels.get(key, key.title()),
+                        "word": value.get("word", ""),
+                        "reading": value.get("reading", ""),
+                    }
+                )
+            return rows
+        if wordKind == "i_adj":
+            forms = BuildIAdjectiveForms(entry.get("headword", ""), entry.get("reading", ""))
+            return [
+                {"label": "Dictionary form", "word": forms["dictionary"]["word"], "reading": forms["dictionary"]["reading"]},
+                {"label": "Past", "word": forms["past"]["word"], "reading": forms["past"]["reading"]},
+                {"label": "Negative", "word": forms["negative"]["word"], "reading": forms["negative"]["reading"]},
+            ]
+        if wordKind == "na_adj":
+            forms = BuildNaAdjectiveForms(entry.get("headword", ""), entry.get("reading", ""))
+            return [
+                {"label": "Dictionary form", "word": forms["dictionary"]["word"], "reading": forms["dictionary"]["reading"]},
+                {"label": "Past", "word": forms["past"]["word"], "reading": forms["past"]["reading"]},
+                {"label": "Negative", "word": forms["negative"]["word"], "reading": forms["negative"]["reading"]},
+            ]
+        return [{"label": "Dictionary form", "word": entry.get("headword", ""), "reading": entry.get("reading", "")}]
+
+    @rx.var
+    def inline_add_is_verb(self) -> bool:
+        return self.inline_add_word_kind in {"ichidan", "godan", "suru", "suru_noun", "kuru"}
+
+    @rx.var
+    def inline_add_is_i_adj(self) -> bool:
+        return self.inline_add_word_kind == "i_adj"
+
+    @rx.var
+    def inline_add_is_na_adj(self) -> bool:
+        return self.inline_add_word_kind == "na_adj"
 
     @rx.var
     def add_cards_preview_json(self) -> str:
@@ -738,12 +1083,33 @@ class AnkiAppState(rx.State):
         self.rename_deck_id = EnsureId(self.rename_deck_id, deckIds)
         self.add_cards_deck_id = EnsureId(self.add_cards_deck_id, deckIds)
         self.custom_deck_id = EnsureId(self.custom_deck_id, deckIds)
+        self.context_deck_id = EnsureId(self.context_deck_id, deckIds)
+        self.inline_add_deck_id = EnsureId(self.inline_add_deck_id, deckIds)
         self.global_source_deck_id = EnsureId(self.global_source_deck_id, deckIds)
         self.global_destination_deck_id = EnsureId(self.global_destination_deck_id, deckIds)
         self.review_deck_id = EnsureId(self.review_deck_id, deckIds)
         self.scan_deck_id = EnsureId(self.scan_deck_id, deckIds)
         self.import_deck_id = EnsureId(self.import_deck_id, deckIds)
         self.export_deck_id = EnsureId(self.export_deck_id, deckIds)
+
+        if self.context_scope == "deck":
+            if not self.context_deck_id:
+                self.context_scope = "global"
+            else:
+                self.review_deck_id = self.context_deck_id
+                self.scan_deck_id = self.context_deck_id
+                self.import_deck_id = self.context_deck_id
+                self.export_deck_id = self.context_deck_id
+                self.add_cards_deck_id = self.context_deck_id
+                self.custom_deck_id = self.context_deck_id
+                self.inline_add_deck_id = self.context_deck_id
+                self.global_destination_deck_id = self.context_deck_id
+
+        validDictionaryEntryIds = {
+            str(entry.get("entry_id", "") or "") for entry in self.dictionary_results
+        }
+        if self.selected_dictionary_entry_id not in validDictionaryEntryIds:
+            self.selected_dictionary_entry_id = next(iter(validDictionaryEntryIds), "")
 
         if self.review_selected_card_ids:
             validCardIds = {row["id"] for row in self.review_card_rows}
@@ -775,6 +1141,108 @@ class AnkiAppState(rx.State):
             if entryId:
                 byId[entryId] = entry
         return [byId[entryId] for entryId in self.custom_autofill_selected_entry_ids if entryId in byId]
+
+    def _update_dictionary_results(self, entries: List[Dict[str, Any]]) -> None:
+        self.dictionary_results = entries
+        validIds = [str(entry.get("entry_id", "") or "") for entry in entries if str(entry.get("entry_id", "") or "")]
+        if not validIds:
+            self.selected_dictionary_entry_id = ""
+            return
+        if self.selected_dictionary_entry_id not in validIds:
+            self.selected_dictionary_entry_id = validIds[0]
+
+    def _detect_inline_word_kind_from_fields(self) -> str:
+        if self.inline_add_dictionary_pos.strip():
+            normalizedPos = self.inline_add_dictionary_pos.lower()
+            if "adjective (keiyoushi)" in normalizedPos or "i-adjective" in normalizedPos:
+                return "i_adj"
+            if "adjectival nouns" in normalizedPos or "na-adjective" in normalizedPos:
+                return "na_adj"
+
+        verbType = self.inline_add_verb_type.strip()
+        if verbType in {"ichidan", "godan", "suru", "suru_noun", "kuru"}:
+            return verbType
+
+        word = self.inline_add_word.strip()
+        reading = self.inline_add_reading.strip()
+        checkText = reading or word
+        if checkText.endswith("する"):
+            return "suru"
+        if checkText.endswith("くる") or checkText.endswith("来る"):
+            return "kuru"
+        if checkText.endswith("い") and not checkText.endswith("ない"):
+            return "i_adj"
+        return "noun"
+
+    def _refresh_inline_forms(self) -> None:
+        dictionaryWord = self.inline_add_word.strip()
+        dictionaryReading = self.inline_add_reading.strip()
+        self.inline_add_form_dictionary_word = dictionaryWord
+        self.inline_add_form_dictionary_reading = dictionaryReading
+
+        # Clear all optional forms first.
+        self.inline_add_form_masu_word = ""
+        self.inline_add_form_masu_reading = ""
+        self.inline_add_form_te_word = ""
+        self.inline_add_form_te_reading = ""
+        self.inline_add_form_past_word = ""
+        self.inline_add_form_past_reading = ""
+        self.inline_add_form_negative_word = ""
+        self.inline_add_form_negative_reading = ""
+        self.inline_add_form_potential_word = ""
+        self.inline_add_form_potential_reading = ""
+        self.inline_add_form_passive_word = ""
+        self.inline_add_form_passive_reading = ""
+        self.inline_add_form_causative_word = ""
+        self.inline_add_form_causative_reading = ""
+
+        if self.inline_add_word_kind in {"ichidan", "godan", "suru", "suru_noun", "kuru"}:
+            entry = {
+                "headword": dictionaryWord,
+                "reading": dictionaryReading,
+                "verb_type": self.inline_add_word_kind,
+                "pos_labels": [],
+                "glosses": [],
+                "entry_id": self.inline_add_dictionary_entry_id,
+            }
+            forms = BuildExtendedVerbForms(entry)
+            self.inline_add_form_masu_word = forms["masu"]["word"]
+            self.inline_add_form_masu_reading = forms["masu"]["reading"]
+            self.inline_add_form_te_word = forms["te"]["word"]
+            self.inline_add_form_te_reading = forms["te"]["reading"]
+            self.inline_add_form_past_word = forms["past"]["word"]
+            self.inline_add_form_past_reading = forms["past"]["reading"]
+            self.inline_add_form_negative_word = forms["negative"]["word"]
+            self.inline_add_form_negative_reading = forms["negative"]["reading"]
+            self.inline_add_form_potential_word = forms["potential"]["word"]
+            self.inline_add_form_potential_reading = forms["potential"]["reading"]
+            self.inline_add_form_passive_word = forms["passive"]["word"]
+            self.inline_add_form_passive_reading = forms["passive"]["reading"]
+            self.inline_add_form_causative_word = forms["causative"]["word"]
+            self.inline_add_form_causative_reading = forms["causative"]["reading"]
+            if self.inline_add_word_form not in {"dictionary", "masu", "te", "past", "negative"}:
+                self.inline_add_word_form = "dictionary"
+            return
+
+        if self.inline_add_word_kind == "i_adj":
+            forms = BuildIAdjectiveForms(dictionaryWord, dictionaryReading)
+            self.inline_add_form_past_word = forms["past"]["word"]
+            self.inline_add_form_past_reading = forms["past"]["reading"]
+            self.inline_add_form_negative_word = forms["negative"]["word"]
+            self.inline_add_form_negative_reading = forms["negative"]["reading"]
+            self.inline_add_word_form = "dictionary"
+            return
+
+        if self.inline_add_word_kind == "na_adj":
+            forms = BuildNaAdjectiveForms(dictionaryWord, dictionaryReading)
+            self.inline_add_form_past_word = forms["past"]["word"]
+            self.inline_add_form_past_reading = forms["past"]["reading"]
+            self.inline_add_form_negative_word = forms["negative"]["word"]
+            self.inline_add_form_negative_reading = forms["negative"]["reading"]
+            self.inline_add_word_form = "dictionary"
+            return
+
+        self.inline_add_word_form = "dictionary"
 
     def _get_review_card_by_id(self, deckId: str, cardId: str) -> Optional[sqlite3.Row]:
         if not deckId or not cardId:
@@ -810,12 +1278,16 @@ class AnkiAppState(rx.State):
 
     def _normalize_page_key(self, pageKey: str) -> str:
         legacyPageMap = {
+            "Dashboard": "Cards",
             "CreateCollections": "Cards",
             "CreateDecks": "Cards",
             "GlobalCards": "Cards",
             "ReviewCards": "Cards",
             "ScanImages": "Cards",
             "SearchDictionary": "Dictionary",
+            "AddCards": "Dictionary",
+            "ImportCsv": "Cards",
+            "ExportDeck": "Cards",
         }
         normalized = legacyPageMap.get(pageKey, pageKey)
         validKeys = {page.Key for page in PageDefinitions}
@@ -846,18 +1318,30 @@ class AnkiAppState(rx.State):
 
     def select_review_deck(self, deckId: str) -> None:
         self.review_deck_id = deckId
+        if deckId:
+            self.context_scope = "deck"
+            self.context_deck_id = deckId
         self.review_selected_card_ids = []
         self.review_confirm_delete = False
         self._sync_single_edit_card_form()
 
     def select_scan_deck(self, deckId: str) -> None:
         self.scan_deck_id = deckId
+        if deckId:
+            self.context_scope = "deck"
+            self.context_deck_id = deckId
 
     def select_import_deck(self, deckId: str) -> None:
         self.import_deck_id = deckId
+        if deckId:
+            self.context_scope = "deck"
+            self.context_deck_id = deckId
 
     def select_export_deck(self, deckId: str) -> None:
         self.export_deck_id = deckId
+        if deckId:
+            self.context_scope = "deck"
+            self.context_deck_id = deckId
 
     def set_add_cards_destination(self, destination: str) -> None:
         self.add_cards_destination = destination
@@ -884,7 +1368,38 @@ class AnkiAppState(rx.State):
         self.custom_deck_id = deckId
 
     def set_cards_scope(self, scope: str) -> None:
-        self.cards_scope = scope
+        self.set_context_scope(scope)
+
+    def set_context_scope(self, scope: str) -> None:
+        self.context_scope = "deck" if scope == "deck" else "global"
+        if self.context_scope == "deck":
+            if not self.context_deck_id and self.deck_options:
+                self.context_deck_id = self.deck_options[0]["id"]
+            if self.context_deck_id:
+                self.review_deck_id = self.context_deck_id
+                self.scan_deck_id = self.context_deck_id
+                self.import_deck_id = self.context_deck_id
+                self.export_deck_id = self.context_deck_id
+                self.inline_add_deck_id = self.context_deck_id
+                self.custom_deck_id = self.context_deck_id
+                self.add_cards_deck_id = self.context_deck_id
+        self.cards_scope = self.context_scope
+
+    def set_context_deck(self, deckId: str) -> None:
+        self.context_deck_id = deckId
+        if deckId:
+            self.context_scope = "deck"
+            self.cards_scope = "deck"
+            self.review_deck_id = deckId
+            self.scan_deck_id = deckId
+            self.import_deck_id = deckId
+            self.export_deck_id = deckId
+            self.inline_add_deck_id = deckId
+            self.custom_deck_id = deckId
+            self.add_cards_deck_id = deckId
+
+    def set_selected_dictionary_entry(self, entryId: str) -> None:
+        self.selected_dictionary_entry_id = entryId
 
     def set_global_destination_schema_key(self, schemaKey: str) -> None:
         self.global_destination_schema_key = schemaKey
@@ -927,6 +1442,10 @@ class AnkiAppState(rx.State):
 
     def set_dictionary_query(self, value: str) -> None:
         self.dictionary_query = value
+        self.app_search_query = value
+
+    def set_app_search_query(self, value: str) -> None:
+        self.app_search_query = value
 
     def set_add_cards_tags(self, value: str) -> None:
         self.add_cards_tags = value
@@ -1024,6 +1543,130 @@ class AnkiAppState(rx.State):
     def set_scan_tags(self, value: str) -> None:
         self.scan_tags = value
 
+    def set_cards_filter_text(self, value: str) -> None:
+        self.cards_filter_text = value
+        self.global_search_text = value
+        self.review_search_text = value
+
+    def set_inline_add_destination(self, destination: str) -> None:
+        self.inline_add_destination = "deck" if destination == "deck" else "global"
+        if self.inline_add_destination == "deck":
+            if not self.inline_add_deck_id:
+                self.inline_add_deck_id = self.context_deck_id or (self.deck_options[0]["id"] if self.deck_options else "")
+            if self.inline_add_deck_id:
+                self.context_scope = "deck"
+                self.context_deck_id = self.inline_add_deck_id
+                self.cards_scope = "deck"
+
+    def set_inline_add_deck(self, deckId: str) -> None:
+        self.inline_add_deck_id = deckId
+        if deckId:
+            self.inline_add_destination = "deck"
+            self.context_scope = "deck"
+            self.context_deck_id = deckId
+            self.cards_scope = "deck"
+
+    def set_inline_add_card_type(self, cardType: str) -> None:
+        if cardType not in {"recognition", "production", "sentence"}:
+            return
+        self.inline_add_card_type = cardType
+        if cardType == "production":
+            self.inline_add_schema_key = "english_front_japanese_back"
+        else:
+            self.inline_add_schema_key = "kana_kanji_front_english_back"
+
+    def set_inline_add_schema_key(self, schemaKey: str) -> None:
+        self.inline_add_schema_key = schemaKey
+
+    def set_inline_add_word_form(self, wordForm: str) -> None:
+        self.inline_add_word_form = wordForm
+
+    def set_inline_add_word_kind(self, wordKind: str) -> None:
+        self.inline_add_word_kind = wordKind
+        self.inline_add_word_kind_override = True
+        self.inline_add_verb_type = wordKind if wordKind in {"ichidan", "godan", "suru", "suru_noun", "kuru"} else ""
+        self._refresh_inline_forms()
+
+    def auto_detect_inline_word_kind(self) -> None:
+        self.inline_add_word_kind_override = False
+        self.inline_add_word_kind = self._detect_inline_word_kind_from_fields()
+        self.inline_add_verb_type = self.inline_add_word_kind if self.inline_add_is_verb else ""
+        self._refresh_inline_forms()
+
+    def set_inline_add_word(self, value: str) -> None:
+        self.inline_add_word = value
+        if not self.inline_add_word_kind_override:
+            self.inline_add_word_kind = self._detect_inline_word_kind_from_fields()
+            self.inline_add_verb_type = self.inline_add_word_kind if self.inline_add_is_verb else ""
+        self._refresh_inline_forms()
+
+    def set_inline_add_reading(self, value: str) -> None:
+        self.inline_add_reading = value
+        if not self.inline_add_word_kind_override:
+            self.inline_add_word_kind = self._detect_inline_word_kind_from_fields()
+            self.inline_add_verb_type = self.inline_add_word_kind if self.inline_add_is_verb else ""
+        self._refresh_inline_forms()
+
+    def set_inline_add_meaning(self, value: str) -> None:
+        self.inline_add_meaning = value
+
+    def set_inline_add_sentence(self, value: str) -> None:
+        self.inline_add_sentence = value
+
+    def set_inline_add_notes(self, value: str) -> None:
+        self.inline_add_notes = value
+
+    def set_inline_add_tags(self, value: str) -> None:
+        self.inline_add_tags = value
+
+    def set_inline_add_form_dictionary_word(self, value: str) -> None:
+        self.inline_add_form_dictionary_word = value
+
+    def set_inline_add_form_dictionary_reading(self, value: str) -> None:
+        self.inline_add_form_dictionary_reading = value
+
+    def set_inline_add_form_masu_word(self, value: str) -> None:
+        self.inline_add_form_masu_word = value
+
+    def set_inline_add_form_masu_reading(self, value: str) -> None:
+        self.inline_add_form_masu_reading = value
+
+    def set_inline_add_form_te_word(self, value: str) -> None:
+        self.inline_add_form_te_word = value
+
+    def set_inline_add_form_te_reading(self, value: str) -> None:
+        self.inline_add_form_te_reading = value
+
+    def set_inline_add_form_past_word(self, value: str) -> None:
+        self.inline_add_form_past_word = value
+
+    def set_inline_add_form_past_reading(self, value: str) -> None:
+        self.inline_add_form_past_reading = value
+
+    def set_inline_add_form_negative_word(self, value: str) -> None:
+        self.inline_add_form_negative_word = value
+
+    def set_inline_add_form_negative_reading(self, value: str) -> None:
+        self.inline_add_form_negative_reading = value
+
+    def set_inline_add_form_potential_word(self, value: str) -> None:
+        self.inline_add_form_potential_word = value
+
+    def set_inline_add_form_potential_reading(self, value: str) -> None:
+        self.inline_add_form_potential_reading = value
+
+    def set_inline_add_form_passive_word(self, value: str) -> None:
+        self.inline_add_form_passive_word = value
+
+    def set_inline_add_form_passive_reading(self, value: str) -> None:
+        self.inline_add_form_passive_reading = value
+
+    def set_inline_add_form_causative_word(self, value: str) -> None:
+        self.inline_add_form_causative_word = value
+
+    def set_inline_add_form_causative_reading(self, value: str) -> None:
+        self.inline_add_form_causative_reading = value
+
     def create_collection(self) -> None:
         name = self.new_collection_name.strip()
         if not name:
@@ -1104,28 +1747,187 @@ class AnkiAppState(rx.State):
 
     def search_dictionary(self) -> None:
         query = self.dictionary_query.strip()
+        self.app_search_query = self.dictionary_query
         if not query:
-            self.dictionary_results = []
+            self._update_dictionary_results([])
             self._set_status("info", "Type a word to search jamdict.")
             return
         try:
-            self.dictionary_results = SearchDictionaryEntries(query, limit=50)
-            if self.dictionary_results:
-                self._set_status("success", f"Found {len(self.dictionary_results)} dictionary entries.")
+            results = SearchDictionaryEntries(query, limit=50)
+            self._update_dictionary_results(results)
+            if results:
+                self._set_status("success", f"Found {len(results)} dictionary entries.")
             else:
                 self._set_status("warning", "No dictionary entries found for this search.")
         except Exception as exc:
-            self.dictionary_results = []
+            self._update_dictionary_results([])
             self._set_status("error", str(exc))
 
     def clear_dictionary_search(self) -> None:
         self.dictionary_query = ""
-        self.dictionary_results = []
+        self.app_search_query = ""
+        self._update_dictionary_results([])
+
+    def update_global_search(self, value: str) -> None:
+        self.app_search_query = value
+        self.dictionary_query = value
+        if value.strip():
+            self.current_page_key = "Dictionary"
+        query = value.strip()
+        if not query:
+            self._update_dictionary_results([])
+            return
+        try:
+            results = SearchDictionaryEntries(query, limit=50)
+            self._update_dictionary_results(results)
+        except Exception as exc:
+            self._update_dictionary_results([])
+            self._set_status("error", str(exc))
+
+    def clear_global_search(self) -> None:
+        self.app_search_query = ""
+        self.dictionary_query = ""
+        self._update_dictionary_results([])
 
     def clear_add_cards_search(self) -> None:
         self.add_cards_query = ""
         self.add_cards_results = []
         self.add_cards_selected_entry_ids = []
+
+    def _get_selected_dictionary_entry_or_none(self) -> Optional[Dict[str, Any]]:
+        if self.selected_dictionary_entry_id:
+            for entry in self.dictionary_results:
+                entryId = str(entry.get("entry_id", "") or "")
+                if entryId == self.selected_dictionary_entry_id:
+                    return entry
+        if self.dictionary_results:
+            return self.dictionary_results[0]
+        return None
+
+    def add_selected_dictionary_entry_to_global_pool(self) -> None:
+        entry = self._get_selected_dictionary_entry_or_none()
+        if not entry:
+            self._set_status("warning", "Select a dictionary entry first.")
+            return
+        noteText = self.inline_add_sentence.strip()
+        payload = BuildGlobalCardFromDictionaryEntry(
+            entry,
+            tags=["japanese", "jamdict", "inline"],
+            notes=noteText,
+        )
+        isAdded = AddGlobalCard(GetConnection(), payload)
+        if isAdded:
+            self._set_status("success", "Added dictionary entry to global pool.")
+        else:
+            self._set_status("warning", "Skipped add to global pool (duplicate or invalid).")
+        self._sync_defaults()
+
+    def add_selected_dictionary_entry_to_deck(self) -> None:
+        entry = self._get_selected_dictionary_entry_or_none()
+        if not entry:
+            self._set_status("warning", "Select a dictionary entry first.")
+            return
+        targetDeckId = self.context_deck_id or self.review_deck_id or self.add_cards_deck_id
+        if not targetDeckId:
+            self._set_status("warning", "Select a destination deck in context first.")
+            return
+        noteText = self.inline_add_sentence.strip()
+        schemaKey = "kana_kanji_front_english_back"
+        payload = BuildCardFromDictionaryEntry(
+            entry,
+            schemaKey,
+            "dictionary",
+            ["japanese", "jamdict", "inline"],
+            notes=noteText,
+        )
+        isAdded = AddCard(GetConnection(), targetDeckId, payload)
+        if isAdded:
+            self._set_status("success", "Added dictionary entry to deck.")
+        else:
+            self._set_status("warning", "Skipped add to deck (duplicate or invalid).")
+        self.set_context_deck(targetDeckId)
+        self._sync_defaults()
+
+    def add_selected_dictionary_entry_to_context(self) -> None:
+        if self.context_scope == "deck":
+            self.add_selected_dictionary_entry_to_deck()
+            return
+        self.add_selected_dictionary_entry_to_global_pool()
+
+    def open_inline_add_drawer(self) -> None:
+        self.inline_add_open = True
+        self.inline_add_source = "manual"
+        self.inline_add_destination = self.context_scope
+        self.inline_add_deck_id = self.context_deck_id
+        self.inline_add_word_kind_override = False
+        if self.inline_add_card_type not in {"recognition", "production", "sentence"}:
+            self.inline_add_card_type = "recognition"
+        self.auto_detect_inline_word_kind()
+
+    def close_inline_add_drawer(self) -> None:
+        self.inline_add_open = False
+
+    def _prefill_inline_add_from_entry(self, entry: Dict[str, Any], source: str) -> None:
+        self.inline_add_open = True
+        self.inline_add_source = source
+        self.inline_add_destination = self.context_scope
+        self.inline_add_deck_id = self.context_deck_id
+        self.inline_add_word = (entry.get("headword") or "").strip()
+        self.inline_add_reading = (entry.get("reading") or "").strip()
+        self.inline_add_meaning = (entry.get("english") or "").strip()
+        examples = entry.get("examples", []) or []
+        if examples:
+            firstExample = examples[0]
+            sentenceText = (firstExample.get("japanese") or "").strip()
+            sentenceReading = (firstExample.get("reading") or "").strip()
+            sentenceEnglish = (firstExample.get("english") or "").strip()
+            sentenceParts = [part for part in [sentenceText, sentenceReading, sentenceEnglish] if part]
+            self.inline_add_sentence = " | ".join(sentenceParts)
+        else:
+            self.inline_add_sentence = ""
+        self.inline_add_dictionary_entry_id = (entry.get("entry_id") or "").strip()
+        self.inline_add_dictionary_headword = (entry.get("headword") or "").strip()
+        self.inline_add_dictionary_reading = (entry.get("reading") or "").strip()
+        self.inline_add_dictionary_gloss = (entry.get("english") or "").strip()
+        self.inline_add_dictionary_pos = ", ".join(entry.get("pos_labels", []) or [])
+        detectedWordKind = DetectInlineWordKind(entry)
+        self.inline_add_word_kind = detectedWordKind
+        self.inline_add_word_kind_override = False
+        self.inline_add_verb_type = detectedWordKind if detectedWordKind in {"ichidan", "godan", "suru", "suru_noun", "kuru"} else ""
+        self._refresh_inline_forms()
+
+    def open_inline_add_from_selected_dictionary(self) -> None:
+        entry = self._get_selected_dictionary_entry_or_none()
+        if not entry:
+            self._set_status("warning", "Select a dictionary entry first.")
+            return
+        self._prefill_inline_add_from_entry(entry, source="dictionary")
+
+    def open_inline_add_from_scan(
+        self,
+        visibleText: str,
+        kanji: str,
+        kana: str,
+        english: str,
+        dictionaryEntryId: str,
+    ) -> None:
+        self.inline_add_open = True
+        self.inline_add_source = "scan"
+        self.inline_add_destination = self.context_scope
+        self.inline_add_deck_id = self.context_deck_id
+        self.inline_add_word = (kanji or visibleText or "").strip()
+        self.inline_add_reading = (kana or "").strip()
+        self.inline_add_meaning = (english or "").strip()
+        self.inline_add_sentence = (visibleText or "").strip()
+        self.inline_add_dictionary_entry_id = (dictionaryEntryId or "").strip()
+        self.inline_add_dictionary_headword = self.inline_add_word
+        self.inline_add_dictionary_reading = self.inline_add_reading
+        self.inline_add_dictionary_gloss = self.inline_add_meaning
+        self.inline_add_dictionary_pos = ""
+        self.inline_add_word_kind_override = False
+        self.inline_add_word_kind = self._detect_inline_word_kind_from_fields()
+        self.inline_add_verb_type = self.inline_add_word_kind if self.inline_add_is_verb else ""
+        self._refresh_inline_forms()
 
     def go_to_add_cards_page(self) -> None:
         self.set_current_page("AddCards")
@@ -1459,6 +2261,151 @@ class AnkiAppState(rx.State):
         self._sync_defaults()
         return rx.clear_selected_files("custom_media_upload")
 
+    async def _save_inline_add_card(self, mediaFiles: list[rx.UploadFile], keepDrawerOpen: bool) -> Any:
+        word = self.inline_add_word.strip() or self.inline_add_form_dictionary_word.strip()
+        reading = self.inline_add_reading.strip() or self.inline_add_form_dictionary_reading.strip()
+        meaning = self.inline_add_meaning.strip()
+        if not word or not reading or not meaning:
+            self._set_status("error", "Word, reading, and meaning are required.")
+            return
+
+        destination = self.inline_add_destination
+        targetDeckId = self.inline_add_deck_id or self.context_deck_id
+        if destination == "deck" and not targetDeckId:
+            self._set_status("warning", "Select a destination deck.")
+            return
+
+        uploadAdapters = await BuildUploadAdapters(mediaFiles)
+        imageAdapters: List[UploadedFileAdapter] = []
+        videoAdapters: List[UploadedFileAdapter] = []
+        for upload in uploadAdapters:
+            suffix = Path(upload.name).suffix.lower()
+            if suffix in SupportedImageExtensions or upload.type.startswith("image/"):
+                imageAdapters.append(upload)
+            elif suffix in SupportedVideoExtensions or upload.type.startswith("video/"):
+                videoAdapters.append(upload)
+
+        mediaDeckId = targetDeckId or "_global_pool"
+        savedImagePaths = [CopyUploadedMedia(upload, mediaDeckId) for upload in imageAdapters]
+        savedVideoPaths = [CopyUploadedMedia(upload, mediaDeckId) for upload in videoAdapters]
+        mediaFilesCombined = [*savedImagePaths, *savedVideoPaths]
+        mediaType = "none"
+        if savedImagePaths and not savedVideoPaths:
+            mediaType = "image"
+        elif savedVideoPaths and not savedImagePaths:
+            mediaType = "video"
+
+        selectedWord = word
+        selectedReading = reading
+        selectedWordForm = "dictionary"
+        if self.inline_add_is_verb:
+            selectedWordForm = self.inline_add_word_form
+            if selectedWordForm == "masu":
+                selectedWord = self.inline_add_form_masu_word.strip() or word
+                selectedReading = self.inline_add_form_masu_reading.strip() or reading
+            elif selectedWordForm == "te":
+                selectedWord = self.inline_add_form_te_word.strip() or word
+                selectedReading = self.inline_add_form_te_reading.strip() or reading
+            elif selectedWordForm == "past":
+                selectedWord = self.inline_add_form_past_word.strip() or word
+                selectedReading = self.inline_add_form_past_reading.strip() or reading
+            elif selectedWordForm == "negative":
+                selectedWord = self.inline_add_form_negative_word.strip() or word
+                selectedReading = self.inline_add_form_negative_reading.strip() or reading
+
+        cardTags = ParseCommaSeparatedTags(self.inline_add_tags)
+        cardTypeTag = f"card_type:{self.inline_add_card_type}"
+        if cardTypeTag not in cardTags:
+            cardTags.append(cardTypeTag)
+
+        noteParts = [self.inline_add_notes.strip()]
+        if self.inline_add_sentence.strip():
+            noteParts.append(f"Sentence: {self.inline_add_sentence.strip()}")
+        mergedNotes = " | ".join([part for part in noteParts if part])
+
+        if destination == "global":
+            payload = {
+                "kanji": word,
+                "kana": reading,
+                "english": meaning,
+                "notes": mergedNotes,
+                "kanji_masu": self.inline_add_form_masu_word.strip(),
+                "kana_masu": self.inline_add_form_masu_reading.strip(),
+                "kanji_te": self.inline_add_form_te_word.strip(),
+                "kana_te": self.inline_add_form_te_reading.strip(),
+                "kanji_past": self.inline_add_form_past_word.strip(),
+                "kana_past": self.inline_add_form_past_reading.strip(),
+                "kanji_negative": self.inline_add_form_negative_word.strip(),
+                "kana_negative": self.inline_add_form_negative_reading.strip(),
+                "image_files": savedImagePaths,
+                "video_files": savedVideoPaths,
+                "tags": cardTags,
+                "dictionary_entry_id": self.inline_add_dictionary_entry_id.strip(),
+                "dictionary_headword": self.inline_add_dictionary_headword.strip() or word,
+                "dictionary_reading": self.inline_add_dictionary_reading.strip() or reading,
+                "dictionary_gloss": self.inline_add_dictionary_gloss.strip() or meaning,
+                "dictionary_pos": self.inline_add_dictionary_pos.strip(),
+                "verb_type": self.inline_add_verb_type.strip(),
+            }
+            isAdded = AddGlobalCard(GetConnection(), payload)
+            if isAdded:
+                self._set_status("success", "Inline card added to global pool.")
+            else:
+                self._set_status("warning", "Inline global add skipped (duplicate or invalid).")
+        else:
+            payload = {
+                "kanji": selectedWord,
+                "kana": selectedReading,
+                "english": meaning,
+                "notes": mergedNotes,
+                "source_text": f"inline:{self.inline_add_source}",
+                "schema_key": self.inline_add_schema_key,
+                "media_type": mediaType,
+                "media_files": mediaFilesCombined,
+                "tags": cardTags,
+                "dictionary_entry_id": self.inline_add_dictionary_entry_id.strip(),
+                "dictionary_headword": self.inline_add_dictionary_headword.strip() or word,
+                "dictionary_reading": self.inline_add_dictionary_reading.strip() or reading,
+                "dictionary_gloss": self.inline_add_dictionary_gloss.strip() or meaning,
+                "dictionary_pos": self.inline_add_dictionary_pos.strip(),
+                "verb_type": self.inline_add_verb_type.strip(),
+                "word_form": selectedWordForm,
+            }
+            isAdded = AddCard(GetConnection(), targetDeckId, payload)
+            if isAdded:
+                self._set_status("success", "Inline card added to deck.")
+            else:
+                self._set_status("warning", "Inline deck add skipped (duplicate or invalid).")
+
+        if destination == "deck" and targetDeckId:
+            self.set_context_deck(targetDeckId)
+
+        self._sync_defaults()
+        if not keepDrawerOpen:
+            self.inline_add_open = False
+        else:
+            self.inline_add_word = ""
+            self.inline_add_reading = ""
+            self.inline_add_meaning = ""
+            self.inline_add_sentence = ""
+            self.inline_add_notes = ""
+            self.inline_add_dictionary_entry_id = ""
+            self.inline_add_dictionary_headword = ""
+            self.inline_add_dictionary_reading = ""
+            self.inline_add_dictionary_gloss = ""
+            self.inline_add_dictionary_pos = ""
+            self.inline_add_verb_type = ""
+            self.inline_add_word_kind_override = False
+            self.inline_add_word_kind = "noun"
+            self._refresh_inline_forms()
+        return rx.clear_selected_files("inline_add_media_upload")
+
+    async def save_inline_add_card(self, mediaFiles: list[rx.UploadFile]) -> Any:
+        return await self._save_inline_add_card(mediaFiles, keepDrawerOpen=False)
+
+    async def save_inline_add_card_and_continue(self, mediaFiles: list[rx.UploadFile]) -> Any:
+        return await self._save_inline_add_card(mediaFiles, keepDrawerOpen=True)
+
     def import_selected_deck_to_global_pool(self) -> None:
         if not self.global_source_deck_id:
             self._set_status("warning", "Select a source deck first.")
@@ -1480,6 +2427,18 @@ class AnkiAppState(rx.State):
 
     def clear_global_card_selection(self) -> None:
         self.global_selected_card_ids = []
+
+    def delete_selected_global_cards(self) -> None:
+        if not self.global_selected_card_ids:
+            self._set_status("warning", "Select one or more global cards to delete.")
+            return
+        deleted = DeleteGlobalCardsByIds(GetConnection(), self.global_selected_card_ids)
+        if deleted <= 0:
+            self._set_status("warning", "No global cards were deleted.")
+        else:
+            self._set_status("success", f"Deleted {deleted} global card(s).")
+        self.global_selected_card_ids = []
+        self._sync_defaults()
 
     def import_selected_global_cards_to_deck(self) -> None:
         if not self.global_destination_deck_id:
@@ -2057,45 +3016,214 @@ def dashboard_page() -> rx.Component:
 def dictionary_page() -> rx.Component:
     return rx.vstack(
         section_box(
-            "Dictionary Search",
-            "Search jamdict and review normalized entry payloads.",
+            "Dictionary",
+            "Search -> Inspect -> Add. Use the global search bar above for instant lookup.",
             rx.hstack(
-                rx.input(
-                    value=AnkiAppState.dictionary_query,
-                    on_change=AnkiAppState.set_dictionary_query,
-                    placeholder="Search word",
-                    width="100%",
-                ),
-                rx.button("Search", on_click=AnkiAppState.search_dictionary, disabled=AnkiAppState.is_busy),
-                rx.button("Clear", on_click=AnkiAppState.clear_dictionary_search, disabled=AnkiAppState.is_busy),
-                width="100%",
-            ),
-            rx.cond(
-                AnkiAppState.has_dictionary_results,
-                rx.vstack(
-                    rx.foreach(
-                        AnkiAppState.dictionary_result_rows,
-                        lambda row: section_box(
-                            row["label"],
-                            "",
-                            rx.text(row["json_text"], white_space="pre-wrap", font_family="monospace", size="2"),
+                rx.box(
+                    rx.vstack(
+                        rx.hstack(
+                            rx.text("Results", weight="bold"),
+                            rx.cond(
+                                AnkiAppState.app_search_query != "",
+                                rx.text(AnkiAppState.app_search_query, color=ThemeStyles["MutedText"], size="2"),
+                            ),
+                            width="100%",
+                            justify="between",
+                            align="center",
                         ),
+                        rx.cond(
+                            AnkiAppState.has_dictionary_results,
+                            rx.vstack(
+                                rx.foreach(
+                                    AnkiAppState.dictionary_result_rows,
+                                    lambda row: rx.box(
+                                        rx.vstack(
+                                            rx.hstack(
+                                                rx.text(row["kanji"], weight="bold"),
+                                                rx.text(f"[{row['reading']}]"),
+                                                width="100%",
+                                                justify="between",
+                                            ),
+                                            rx.text(row["meaning_preview"], size="2", color=ThemeStyles["MutedText"]),
+                                            rx.cond(
+                                                row["pos_preview"] != "",
+                                                rx.text(row["pos_preview"], size="1", color=ThemeStyles["MutedText"]),
+                                            ),
+                                            spacing="1",
+                                            align="start",
+                                            width="100%",
+                                        ),
+                                        padding="10px",
+                                        border_radius="8px",
+                                        border="1px solid #2a3d53",
+                                        background=rx.cond(row["selected"], "#22344b", "#121b29"),
+                                        width="100%",
+                                        cursor="pointer",
+                                        on_click=AnkiAppState.set_selected_dictionary_entry(row["entry_id"]),
+                                    ),
+                                ),
+                                spacing="2",
+                                align="stretch",
+                                width="100%",
+                            ),
+                            rx.text("Type in global search to see dictionary results."),
+                        ),
+                        spacing="3",
+                        align="stretch",
+                        width="100%",
                     ),
-                    align="stretch",
-                    spacing="2",
-                    width="100%",
+                    width="38%",
                 ),
-                rx.text("Search jamdict to view dictionary entries."),
-            ),
-        ),
-        section_box(
-            "Quick Action",
-            "",
-            rx.button(
-                "Go To Add Cards",
-                on_click=AnkiAppState.go_to_add_cards_page,
-                disabled=AnkiAppState.is_busy,
-                width="220px",
+                rx.box(
+                    rx.cond(
+                        AnkiAppState.has_selected_dictionary_entry,
+                        rx.vstack(
+                            rx.vstack(
+                                rx.heading(AnkiAppState.selected_dictionary_headword, size="8"),
+                                rx.hstack(rx.text("["), rx.text(AnkiAppState.selected_dictionary_reading), rx.text("]")),
+                                rx.text(
+                                    AnkiAppState.selected_dictionary_pos_text,
+                                    color=ThemeStyles["MutedText"],
+                                    size="2",
+                                ),
+                                spacing="1",
+                                align="start",
+                                width="100%",
+                            ),
+                            section_box(
+                                "Meanings",
+                                "",
+                                rx.foreach(
+                                    AnkiAppState.selected_dictionary_sense_rows,
+                                    lambda sense: rx.box(
+                                        rx.vstack(
+                                            rx.hstack(
+                                                rx.text(f"Sense {sense['sense_index']}", weight="bold"),
+                                                rx.text(
+                                                    sense["pos_text"],
+                                                    size="1",
+                                                    color=ThemeStyles["MutedText"],
+                                                ),
+                                                width="100%",
+                                                justify="between",
+                                                align="center",
+                                            ),
+                                            rx.text(sense["gloss_text"]),
+                                            rx.cond(
+                                                sense["notes_text"] != "",
+                                                rx.text(
+                                                    sense["notes_text"],
+                                                    size="1",
+                                                    color=ThemeStyles["MutedText"],
+                                                ),
+                                            ),
+                                            spacing="1",
+                                            align="start",
+                                            width="100%",
+                                        ),
+                                        border="1px solid #253447",
+                                        border_radius="8px",
+                                        padding="10px",
+                                        width="100%",
+                                    ),
+                                ),
+                            ),
+                            section_box(
+                                "Conjugations",
+                                "Automatically generated forms for verbs/adjectives.",
+                                rx.foreach(
+                                    AnkiAppState.selected_dictionary_conjugation_rows,
+                                    lambda form: rx.hstack(
+                                        rx.text(form["label"], width="28%", color=ThemeStyles["MutedText"]),
+                                        rx.text(form["word"], width="32%"),
+                                        rx.text(form["reading"], width="40%"),
+                                        width="100%",
+                                        border_bottom="1px solid #253447",
+                                        padding_y="6px",
+                                    ),
+                                ),
+                            ),
+                            section_box(
+                                "Example Sentences",
+                                "",
+                                rx.cond(
+                                    AnkiAppState.has_selected_dictionary_examples,
+                                    rx.vstack(
+                                        rx.foreach(
+                                            AnkiAppState.selected_dictionary_example_rows,
+                                            lambda example: rx.box(
+                                                rx.vstack(
+                                                    rx.text(example["japanese"]),
+                                                    rx.cond(
+                                                        example["reading"] != "",
+                                                        rx.text(
+                                                            example["reading"],
+                                                            size="2",
+                                                            color=ThemeStyles["MutedText"],
+                                                        ),
+                                                    ),
+                                                    rx.cond(
+                                                        example["english"] != "",
+                                                        rx.text(example["english"], size="2"),
+                                                    ),
+                                                    spacing="1",
+                                                    align="start",
+                                                    width="100%",
+                                                ),
+                                                border="1px solid #253447",
+                                                border_radius="8px",
+                                                padding="10px",
+                                                width="100%",
+                                            ),
+                                        ),
+                                        spacing="2",
+                                        align="stretch",
+                                        width="100%",
+                                    ),
+                                    rx.text("No example sentences available for this entry."),
+                                ),
+                            ),
+                            section_box(
+                                "Actions",
+                                "",
+                                rx.hstack(
+                                    rx.button(
+                                        "Add To Current Context",
+                                        on_click=AnkiAppState.add_selected_dictionary_entry_to_context,
+                                        disabled=AnkiAppState.is_busy,
+                                    ),
+                                    rx.button(
+                                        "Add To Deck",
+                                        on_click=AnkiAppState.add_selected_dictionary_entry_to_deck,
+                                        disabled=AnkiAppState.is_busy,
+                                    ),
+                                    rx.button(
+                                        "Add To Global Pool",
+                                        on_click=AnkiAppState.add_selected_dictionary_entry_to_global_pool,
+                                        disabled=AnkiAppState.is_busy,
+                                    ),
+                                    width="100%",
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                rx.button(
+                                    "Add Custom Card",
+                                    on_click=AnkiAppState.open_inline_add_from_selected_dictionary,
+                                    disabled=AnkiAppState.is_busy,
+                                    width="220px",
+                                ),
+                            ),
+                            spacing="3",
+                            align="stretch",
+                            width="100%",
+                        ),
+                        rx.text("Select a word from results to inspect details."),
+                    ),
+                    width="62%",
+                ),
+                width="100%",
+                align="start",
+                spacing="3",
             ),
         ),
         spacing="3",
@@ -2194,38 +3322,354 @@ def decks_page() -> rx.Component:
 
 def cards_page() -> rx.Component:
     return rx.vstack(
-        section_box(
-            "Quick Actions",
-            "",
-            rx.button(
-                "Go To Add Cards",
-                on_click=AnkiAppState.go_to_add_cards_page,
-                disabled=AnkiAppState.is_busy,
-                width="220px",
+        rx.flex(
+            rx.box(
+                section_box("Collections", "", rx.heading(AnkiAppState.dashboard_collection_count, size="6")),
+                flex="1",
+                min_width="180px",
             ),
+            rx.box(
+                section_box("Decks", "", rx.heading(AnkiAppState.dashboard_deck_count, size="6")),
+                flex="1",
+                min_width="180px",
+            ),
+            rx.box(
+                section_box("Deck Cards", "", rx.heading(AnkiAppState.dashboard_card_count, size="6")),
+                flex="1",
+                min_width="180px",
+            ),
+            rx.box(
+                section_box("Global Cards", "", rx.heading(AnkiAppState.dashboard_global_card_count, size="6")),
+                flex="1",
+                min_width="180px",
+            ),
+            wrap="wrap",
+            gap="10px",
+            width="100%",
         ),
-        section_box("Collections", "Create / rename collections.", collections_page()),
-        section_box("Decks", "Create / rename decks.", decks_page()),
         section_box(
-            "Card Source",
-            "Switch between global pool and deck cards.",
+            "Cards Workspace",
+            "Manage cards, decks, media replacement, scan, and imports in one unified workflow.",
             rx.flex(
                 *[
                     choice_button(
                         option["label"],
-                        AnkiAppState.cards_scope == option["key"],
-                        AnkiAppState.set_cards_scope(option["key"]),
+                        AnkiAppState.context_scope == option["key"],
+                        AnkiAppState.set_context_scope(option["key"]),
                         AnkiAppState.is_busy,
                     )
-                    for option in CardsScopeOptions
+                    for option in ContextScopeOptions
                 ],
                 wrap="wrap",
                 gap="8px",
+                width="100%",
+            ),
+            rx.hstack(
+                rx.text(AnkiAppState.context_summary_text, color=ThemeStyles["MutedText"]),
+                rx.button(
+                    "Add Card",
+                    on_click=AnkiAppState.open_inline_add_drawer,
+                    disabled=AnkiAppState.is_busy,
+                    width="140px",
+                ),
+                width="100%",
+                justify="between",
+                align="center",
+            ),
+            rx.cond(
+                AnkiAppState.context_scope == "deck",
+                deck_picker("Context Deck", AnkiAppState.selected_context_deck_label, AnkiAppState.set_context_deck),
+            ),
+            rx.input(
+                value=AnkiAppState.cards_filter_text,
+                on_change=AnkiAppState.set_cards_filter_text,
+                placeholder="Filter cards in current context",
             ),
         ),
-        rx.cond(AnkiAppState.cards_scope == "global", global_cards_page()),
-        rx.cond(AnkiAppState.cards_scope == "deck", review_cards_page()),
-        section_box("Scan", "Scan images for missing cards.", scan_images_page()),
+        rx.hstack(
+            rx.box(
+                rx.cond(
+                    AnkiAppState.context_scope == "global",
+                    section_box(
+                        "Global Pool Cards",
+                        "",
+                        rx.cond(
+                            AnkiAppState.has_filtered_global_cards,
+                            rx.vstack(
+                                rx.foreach(
+                                    AnkiAppState.filtered_global_card_rows,
+                                    lambda row: rx.hstack(
+                                        rx.vstack(
+                                            rx.text(row["label"]),
+                                            rx.flex(
+                                                rx.text("dict:", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text(row["dictionary_entry_id"], size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text("|", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text("masu:", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text(row["masu"], size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text("|", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text("te:", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text(row["te"], size="1", color=ThemeStyles["MutedText"]),
+                                                wrap="wrap",
+                                                gap="4px",
+                                            ),
+                                            align="start",
+                                            width="82%",
+                                        ),
+                                        rx.button(
+                                            rx.cond(row["selected"], "Remove", "Select"),
+                                            on_click=AnkiAppState.toggle_global_card_selection(row["id"]),
+                                            disabled=AnkiAppState.is_busy,
+                                            width="120px",
+                                        ),
+                                        width="100%",
+                                        border_bottom="1px solid #253447",
+                                        padding_y="6px",
+                                    ),
+                                ),
+                                align="stretch",
+                                spacing="0",
+                                width="100%",
+                            ),
+                            rx.text("No global cards match the current filter."),
+                        ),
+                        rx.hstack(rx.text("Selected global cards:"), rx.text(AnkiAppState.global_selected_count)),
+                        rx.hstack(
+                            rx.button(
+                                "Clear selection",
+                                on_click=AnkiAppState.clear_global_card_selection,
+                                disabled=AnkiAppState.is_busy,
+                                width="180px",
+                            ),
+                            rx.button(
+                                "Delete selected global cards",
+                                on_click=AnkiAppState.delete_selected_global_cards,
+                                disabled=AnkiAppState.is_busy,
+                                width="240px",
+                                background="#4a2320",
+                            ),
+                            width="100%",
+                            wrap="wrap",
+                            gap="8px",
+                        ),
+                        deck_picker(
+                            "Destination Deck for Selected Global Cards",
+                            AnkiAppState.selected_global_destination_deck_label,
+                            AnkiAppState.select_global_destination_deck,
+                        ),
+                        schema_picker(
+                            "Card Format on Import",
+                            AnkiAppState.global_destination_schema_key,
+                            AnkiAppState.set_global_destination_schema_key,
+                        ),
+                        word_form_picker(
+                            "Word Form on Import",
+                            AnkiAppState.global_destination_word_form,
+                            AnkiAppState.set_global_destination_word_form,
+                        ),
+                        rx.input(
+                            value=AnkiAppState.global_import_tags,
+                            on_change=AnkiAppState.set_global_import_tags,
+                            placeholder="Extra tags for deck import (comma separated)",
+                        ),
+                        rx.button(
+                            "Import selected global cards into deck",
+                            on_click=AnkiAppState.import_selected_global_cards_to_deck,
+                            disabled=AnkiAppState.is_busy,
+                            width="320px",
+                        ),
+                    ),
+                    section_box(
+                        "Deck Cards",
+                        "",
+                        rx.cond(
+                            AnkiAppState.has_review_cards,
+                            rx.vstack(
+                                rx.hstack(
+                                    rx.button(
+                                        "Select all visible",
+                                        on_click=AnkiAppState.select_all_visible_review_cards,
+                                        disabled=AnkiAppState.is_busy,
+                                    ),
+                                    rx.button(
+                                        "Clear selection",
+                                        on_click=AnkiAppState.clear_review_card_selection,
+                                        disabled=AnkiAppState.is_busy,
+                                    ),
+                                    width="100%",
+                                ),
+                                rx.foreach(
+                                    AnkiAppState.review_card_rows,
+                                    lambda row: rx.hstack(
+                                        rx.vstack(
+                                            rx.text(row["label"]),
+                                            rx.flex(
+                                                rx.text("Word form:", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text(row["word_form"], size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text("|", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text("Dictionary:", size="1", color=ThemeStyles["MutedText"]),
+                                                rx.text(row["dictionary_id"], size="1", color=ThemeStyles["MutedText"]),
+                                                wrap="wrap",
+                                                gap="4px",
+                                            ),
+                                            align="start",
+                                            width="82%",
+                                        ),
+                                        rx.button(
+                                            rx.cond(row["selected"], "Remove", "Select"),
+                                            on_click=AnkiAppState.toggle_review_card_selection(row["id"]),
+                                            disabled=AnkiAppState.is_busy,
+                                            width="120px",
+                                        ),
+                                        width="100%",
+                                        border_bottom="1px solid #253447",
+                                        padding_y="6px",
+                                    ),
+                                ),
+                                align="stretch",
+                                spacing="0",
+                                width="100%",
+                            ),
+                            rx.text("No cards in the selected deck match the current filter."),
+                        ),
+                        rx.hstack(rx.text("Selected cards:"), rx.text(AnkiAppState.review_selected_count)),
+                        schema_picker(
+                            "Bulk Format Update",
+                            AnkiAppState.review_bulk_format,
+                            AnkiAppState.set_review_bulk_format,
+                        ),
+                        rx.button(
+                            "Apply selected format",
+                            on_click=AnkiAppState.apply_review_bulk_format,
+                            disabled=AnkiAppState.is_busy,
+                            width="220px",
+                        ),
+                        rx.button(
+                            rx.cond(AnkiAppState.review_confirm_delete, "Delete confirmed", "Confirm delete selected cards"),
+                            on_click=AnkiAppState.toggle_review_confirm_delete,
+                            disabled=AnkiAppState.is_busy,
+                            width="280px",
+                            background=rx.cond(AnkiAppState.review_confirm_delete, "#4a2320", "#121b29"),
+                        ),
+                        rx.button(
+                            "Delete selected cards",
+                            on_click=AnkiAppState.delete_selected_review_cards,
+                            disabled=AnkiAppState.is_busy,
+                            width="220px",
+                        ),
+                    ),
+                ),
+                width="66%",
+            ),
+            rx.box(
+                rx.vstack(
+                    section_box(
+                        "Edit / Replace Media",
+                        "Select one deck card to edit or replace media.",
+                        rx.cond(
+                            AnkiAppState.has_single_edit_card,
+                            rx.vstack(
+                                rx.text(AnkiAppState.single_edit_metadata_json, white_space="pre-wrap", font_family="monospace"),
+                                rx.input(value=AnkiAppState.single_edit_kanji, on_change=AnkiAppState.set_single_edit_kanji, placeholder="Kanji"),
+                                rx.input(value=AnkiAppState.single_edit_kana, on_change=AnkiAppState.set_single_edit_kana, placeholder="Kana"),
+                                rx.input(value=AnkiAppState.single_edit_english, on_change=AnkiAppState.set_single_edit_english, placeholder="English"),
+                                rx.text_area(value=AnkiAppState.single_edit_notes, on_change=AnkiAppState.set_single_edit_notes, placeholder="Notes"),
+                                rx.flex(
+                                    *[
+                                        choice_button(
+                                            option["label"],
+                                            AnkiAppState.single_edit_schema_key == option["key"],
+                                            AnkiAppState.set_single_edit_schema_key(option["key"]),
+                                            AnkiAppState.is_busy,
+                                        )
+                                        for option in CardSchemaOptionRows
+                                    ],
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                rx.button(
+                                    "Save text changes",
+                                    on_click=AnkiAppState.save_single_review_card_changes,
+                                    disabled=AnkiAppState.is_busy,
+                                    width="220px",
+                                ),
+                                rx.flex(
+                                    *[
+                                        choice_button(
+                                            option["label"],
+                                            AnkiAppState.review_replace_target == option["key"],
+                                            AnkiAppState.set_review_replace_target(option["key"]),
+                                            AnkiAppState.is_busy,
+                                        )
+                                        for option in ReviewReplaceTargetOptions
+                                    ],
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                rx.flex(
+                                    *[
+                                        choice_button(
+                                            option["label"],
+                                            AnkiAppState.review_replace_media_type == option["key"],
+                                            AnkiAppState.set_review_replace_media_type(option["key"]),
+                                            AnkiAppState.is_busy,
+                                        )
+                                        for option in ReviewMediaTypeOptions
+                                    ],
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                rx.upload(rx.button("Select media files"), id="review_media_upload", multiple=True),
+                                rx.vstack(
+                                    rx.foreach(rx.selected_files("review_media_upload"), rx.text),
+                                    align="stretch",
+                                    spacing="1",
+                                    width="100%",
+                                ),
+                                rx.button(
+                                    "Apply media replacement",
+                                    on_click=lambda: AnkiAppState.apply_single_review_media_replacement(
+                                        rx.upload_files(upload_id="review_media_upload")
+                                    ),
+                                    disabled=AnkiAppState.is_busy,
+                                    width="220px",
+                                ),
+                                spacing="2",
+                                width="100%",
+                            ),
+                            rx.text("Select exactly one deck card to edit."),
+                        ),
+                    ),
+                    section_box("Collections", "Create / Rename / Replace collections.", collections_page()),
+                    section_box("Decks", "Create / Rename / Replace decks.", decks_page()),
+                    section_box(
+                        "Global Sync",
+                        "Import all cards from a deck into global pool.",
+                        deck_picker(
+                            "Source Deck",
+                            AnkiAppState.selected_global_source_deck_label,
+                            AnkiAppState.select_global_source_deck,
+                        ),
+                        rx.button(
+                            "Import all cards from selected deck to global pool",
+                            on_click=AnkiAppState.import_selected_deck_to_global_pool,
+                            disabled=AnkiAppState.is_busy,
+                            width="360px",
+                        ),
+                    ),
+                    section_box("Scan", "Scan images for missing cards in the selected context deck.", scan_images_page()),
+                    section_box("Import CSV", "", import_csv_page()),
+                    section_box("Export Deck", "", export_deck_page()),
+                    spacing="3",
+                    align="stretch",
+                    width="100%",
+                ),
+                width="34%",
+            ),
+            width="100%",
+            align="start",
+            spacing="3",
+        ),
         spacing="3",
         width="100%",
     )
@@ -2709,11 +4153,23 @@ def global_cards_page() -> rx.Component:
                 rx.text("No global cards match the current search."),
             ),
             rx.hstack(rx.text("Selected global cards:"), rx.text(AnkiAppState.global_selected_count)),
-            rx.button(
-                "Clear selection",
-                on_click=AnkiAppState.clear_global_card_selection,
-                disabled=AnkiAppState.is_busy,
-                width="160px",
+            rx.hstack(
+                rx.button(
+                    "Clear selection",
+                    on_click=AnkiAppState.clear_global_card_selection,
+                    disabled=AnkiAppState.is_busy,
+                    width="160px",
+                ),
+                rx.button(
+                    "Delete selected global cards",
+                    on_click=AnkiAppState.delete_selected_global_cards,
+                    disabled=AnkiAppState.is_busy,
+                    width="240px",
+                    background="#4a2320",
+                ),
+                width="100%",
+                wrap="wrap",
+                gap="8px",
             ),
         ),
         deck_picker("Destination Deck for Selected Global Cards", AnkiAppState.selected_global_destination_deck_label, AnkiAppState.select_global_destination_deck),
@@ -2915,19 +4371,37 @@ def scan_images_page() -> rx.Component:
                     rx.foreach(
                         AnkiAppState.scan_preview_rows,
                         lambda row: rx.box(
-                            rx.flex(
-                                rx.text(row["visible_text"]),
-                                rx.text("->"),
-                                rx.text(row["kanji"]),
-                                rx.text("["),
-                                rx.text(row["kana"]),
-                                rx.text("]"),
-                                rx.text("|"),
-                                rx.text(row["english"]),
-                                rx.text("| JMDict #"),
-                                rx.text(row["dictionary_entry_id"]),
-                                wrap="wrap",
-                                gap="4px",
+                            rx.hstack(
+                                rx.flex(
+                                    rx.text(row["visible_text"]),
+                                    rx.text("->"),
+                                    rx.text(row["kanji"]),
+                                    rx.text("["),
+                                    rx.text(row["kana"]),
+                                    rx.text("]"),
+                                    rx.text("|"),
+                                    rx.text(row["english"]),
+                                    rx.text("| JMDict #"),
+                                    rx.text(row["dictionary_entry_id"]),
+                                    wrap="wrap",
+                                    gap="4px",
+                                    width="78%",
+                                ),
+                                rx.button(
+                                    "Add Card",
+                                    on_click=AnkiAppState.open_inline_add_from_scan(
+                                        row["visible_text"],
+                                        row["kanji"],
+                                        row["kana"],
+                                        row["english"],
+                                        row["dictionary_entry_id"],
+                                    ),
+                                    disabled=AnkiAppState.is_busy,
+                                    width="100px",
+                                ),
+                                justify="between",
+                                align="center",
+                                width="100%",
                             ),
                             width="100%",
                             border_bottom="1px solid #253447",
@@ -3002,14 +4476,323 @@ def export_deck_page() -> rx.Component:
     )
 
 
+def app_flow_header() -> rx.Component:
+    return section_box(
+        "Search -> Inspect -> Add -> Manage -> Review",
+        "",
+        rx.hstack(
+            rx.input(
+                value=AnkiAppState.app_search_query,
+                on_change=AnkiAppState.update_global_search,
+                placeholder="Global search (kanji / kana / meaning)",
+                width="100%",
+            ),
+            rx.button("Clear", on_click=AnkiAppState.clear_global_search, disabled=AnkiAppState.is_busy),
+            width="100%",
+        ),
+        rx.flex(
+            *[
+                choice_button(
+                    option["label"],
+                    AnkiAppState.context_scope == option["key"],
+                    AnkiAppState.set_context_scope(option["key"]),
+                    AnkiAppState.is_busy,
+                )
+                for option in ContextScopeOptions
+            ],
+            wrap="wrap",
+            gap="8px",
+        ),
+        rx.hstack(
+            rx.text(AnkiAppState.context_summary_text, color=ThemeStyles["MutedText"]),
+            rx.cond(
+                AnkiAppState.context_scope == "deck",
+                rx.button(
+                    "Jump To Cards",
+                    on_click=AnkiAppState.go_to_cards_page,
+                    disabled=AnkiAppState.is_busy,
+                    width="140px",
+                ),
+            ),
+            width="100%",
+            justify="between",
+            align="center",
+        ),
+        rx.cond(
+            AnkiAppState.context_scope == "deck",
+            rx.box(
+                rx.text("Context Deck", size="2", color=ThemeStyles["MutedText"]),
+                rx.flex(
+                    rx.foreach(
+                        AnkiAppState.deck_options,
+                        lambda option: choice_button(
+                            option["label"],
+                            AnkiAppState.selected_context_deck_label == option["label"],
+                            AnkiAppState.set_context_deck(option["id"]),
+                            AnkiAppState.is_busy,
+                        ),
+                    ),
+                    wrap="wrap",
+                    gap="8px",
+                ),
+                width="100%",
+            ),
+        ),
+    )
+
+
+def inline_add_drawer() -> rx.Component:
+    return rx.cond(
+        AnkiAppState.inline_add_open,
+        rx.box(
+            rx.box(
+                position="fixed",
+                inset="0",
+                background="rgba(0,0,0,0.45)",
+                z_index="50",
+                on_click=AnkiAppState.close_inline_add_drawer,
+            ),
+            rx.box(
+                rx.vstack(
+                    rx.hstack(
+                        rx.heading("Add Card", size="6"),
+                        rx.button(
+                            "Close",
+                            on_click=AnkiAppState.close_inline_add_drawer,
+                            disabled=AnkiAppState.is_busy,
+                        ),
+                        width="100%",
+                        justify="between",
+                    ),
+                    rx.text("Inline card creation drawer. Fields are editable before saving.", size="2", color=ThemeStyles["MutedText"]),
+                    rx.flex(
+                        *[
+                            choice_button(
+                                option["label"],
+                                AnkiAppState.inline_add_destination == option["key"],
+                                AnkiAppState.set_inline_add_destination(option["key"]),
+                                AnkiAppState.is_busy,
+                            )
+                            for option in AddDestinationOptions
+                        ],
+                        wrap="wrap",
+                        gap="8px",
+                    ),
+                    rx.cond(
+                        AnkiAppState.inline_add_destination == "deck",
+                        deck_picker(
+                            "Destination Deck",
+                            AnkiAppState.selected_inline_add_deck_label,
+                            AnkiAppState.set_inline_add_deck,
+                        ),
+                    ),
+                    section_box(
+                        "Card Type",
+                        "",
+                        rx.flex(
+                            *[
+                                choice_button(
+                                    option["label"],
+                                    AnkiAppState.inline_add_card_type == option["key"],
+                                    AnkiAppState.set_inline_add_card_type(option["key"]),
+                                    AnkiAppState.is_busy,
+                                )
+                                for option in InlineCardTypeOptions
+                            ],
+                            wrap="wrap",
+                            gap="8px",
+                        ),
+                        schema_picker(
+                            "Card Format",
+                            AnkiAppState.inline_add_schema_key,
+                            AnkiAppState.set_inline_add_schema_key,
+                        ),
+                    ),
+                    section_box(
+                        "Core Fields",
+                        "",
+                        rx.input(
+                            value=AnkiAppState.inline_add_word,
+                            on_change=AnkiAppState.set_inline_add_word,
+                            placeholder="Word (kanji-only or kanji+okurigana)",
+                        ),
+                        rx.input(
+                            value=AnkiAppState.inline_add_reading,
+                            on_change=AnkiAppState.set_inline_add_reading,
+                            placeholder="Reading (kana)",
+                        ),
+                        rx.input(
+                            value=AnkiAppState.inline_add_meaning,
+                            on_change=AnkiAppState.set_inline_add_meaning,
+                            placeholder="Meaning",
+                        ),
+                        rx.text_area(
+                            value=AnkiAppState.inline_add_sentence,
+                            on_change=AnkiAppState.set_inline_add_sentence,
+                            placeholder="Sentence (optional but encouraged)",
+                        ),
+                    ),
+                    section_box(
+                        "Word Type",
+                        "Auto-detected, with manual override support.",
+                        rx.button(
+                            "Auto Detect Type",
+                            on_click=AnkiAppState.auto_detect_inline_word_kind,
+                            disabled=AnkiAppState.is_busy,
+                            width="160px",
+                        ),
+                        rx.flex(
+                            *[
+                                choice_button(
+                                    option["label"],
+                                    AnkiAppState.inline_add_word_kind == option["key"],
+                                    AnkiAppState.set_inline_add_word_kind(option["key"]),
+                                    AnkiAppState.is_busy,
+                                )
+                                for option in InlineWordKindOptions
+                            ],
+                            wrap="wrap",
+                            gap="8px",
+                        ),
+                    ),
+                    rx.cond(
+                        AnkiAppState.inline_add_is_verb,
+                        section_box(
+                            "Verb Forms",
+                            "",
+                            word_form_picker(
+                                "Word Form To Add To Deck",
+                                AnkiAppState.inline_add_word_form,
+                                AnkiAppState.set_inline_add_word_form,
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_dictionary_word, on_change=AnkiAppState.set_inline_add_form_dictionary_word, placeholder="Dictionary (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_dictionary_reading, on_change=AnkiAppState.set_inline_add_form_dictionary_reading, placeholder="Dictionary (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_masu_word, on_change=AnkiAppState.set_inline_add_form_masu_word, placeholder="Masu (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_masu_reading, on_change=AnkiAppState.set_inline_add_form_masu_reading, placeholder="Masu (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_te_word, on_change=AnkiAppState.set_inline_add_form_te_word, placeholder="Te (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_te_reading, on_change=AnkiAppState.set_inline_add_form_te_reading, placeholder="Te (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_past_word, on_change=AnkiAppState.set_inline_add_form_past_word, placeholder="Ta (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_past_reading, on_change=AnkiAppState.set_inline_add_form_past_reading, placeholder="Ta (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_negative_word, on_change=AnkiAppState.set_inline_add_form_negative_word, placeholder="Nai (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_negative_reading, on_change=AnkiAppState.set_inline_add_form_negative_reading, placeholder="Nai (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_potential_word, on_change=AnkiAppState.set_inline_add_form_potential_word, placeholder="Potential (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_potential_reading, on_change=AnkiAppState.set_inline_add_form_potential_reading, placeholder="Potential (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_passive_word, on_change=AnkiAppState.set_inline_add_form_passive_word, placeholder="Passive (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_passive_reading, on_change=AnkiAppState.set_inline_add_form_passive_reading, placeholder="Passive (kana)"),
+                                width="100%",
+                            ),
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_causative_word, on_change=AnkiAppState.set_inline_add_form_causative_word, placeholder="Causative (kanji)"),
+                                rx.input(value=AnkiAppState.inline_add_form_causative_reading, on_change=AnkiAppState.set_inline_add_form_causative_reading, placeholder="Causative (kana)"),
+                                width="100%",
+                            ),
+                        ),
+                    ),
+                    rx.cond(
+                        AnkiAppState.inline_add_is_i_adj,
+                        section_box(
+                            "I-adjective Forms",
+                            "",
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_past_word, on_change=AnkiAppState.set_inline_add_form_past_word, placeholder="Past"),
+                                rx.input(value=AnkiAppState.inline_add_form_negative_word, on_change=AnkiAppState.set_inline_add_form_negative_word, placeholder="Negative"),
+                                width="100%",
+                            ),
+                        ),
+                    ),
+                    rx.cond(
+                        AnkiAppState.inline_add_is_na_adj,
+                        section_box(
+                            "Na-adjective Forms",
+                            "",
+                            rx.hstack(
+                                rx.input(value=AnkiAppState.inline_add_form_past_word, on_change=AnkiAppState.set_inline_add_form_past_word, placeholder="Past"),
+                                rx.input(value=AnkiAppState.inline_add_form_negative_word, on_change=AnkiAppState.set_inline_add_form_negative_word, placeholder="Negative"),
+                                width="100%",
+                            ),
+                        ),
+                    ),
+                    section_box(
+                        "Metadata",
+                        "",
+                        rx.input(value=AnkiAppState.inline_add_notes, on_change=AnkiAppState.set_inline_add_notes, placeholder="Notes"),
+                        rx.input(value=AnkiAppState.inline_add_tags, on_change=AnkiAppState.set_inline_add_tags, placeholder="Tags (comma separated)"),
+                    ),
+                    rx.upload(
+                        rx.button("Select optional images/videos"),
+                        id="inline_add_media_upload",
+                        multiple=True,
+                    ),
+                    rx.vstack(
+                        rx.foreach(rx.selected_files("inline_add_media_upload"), rx.text),
+                        align="stretch",
+                        spacing="1",
+                        width="100%",
+                    ),
+                    rx.hstack(
+                        rx.button(
+                            "Save",
+                            on_click=lambda: AnkiAppState.save_inline_add_card(
+                                rx.upload_files(upload_id="inline_add_media_upload")
+                            ),
+                            disabled=AnkiAppState.is_busy,
+                            width="120px",
+                        ),
+                        rx.button(
+                            "Save + Add Another",
+                            on_click=lambda: AnkiAppState.save_inline_add_card_and_continue(
+                                rx.upload_files(upload_id="inline_add_media_upload")
+                            ),
+                            disabled=AnkiAppState.is_busy,
+                            width="180px",
+                        ),
+                        width="100%",
+                    ),
+                    spacing="3",
+                    align="stretch",
+                    width="100%",
+                ),
+                position="fixed",
+                top="0",
+                right="0",
+                height="100vh",
+                width=["100%", "540px"],
+                background=ThemeStyles["SidebarBackground"],
+                border_left=ThemeStyles["SidebarBorder"],
+                padding="16px",
+                overflow_y="auto",
+                z_index="60",
+            ),
+        ),
+    )
+
+
 def page_content() -> rx.Component:
     return rx.vstack(
-        rx.cond(AnkiAppState.current_page_key == "Dashboard", dashboard_page()),
-        rx.cond(AnkiAppState.current_page_key == "Dictionary", dictionary_page()),
-        rx.cond(AnkiAppState.current_page_key == "Cards", cards_page()),
-        rx.cond(AnkiAppState.current_page_key == "AddCards", add_cards_page()),
-        rx.cond(AnkiAppState.current_page_key == "ImportCsv", import_csv_page()),
-        rx.cond(AnkiAppState.current_page_key == "ExportDeck", export_deck_page()),
+        rx.cond(
+            AnkiAppState.current_page_key == "Cards",
+            cards_page(),
+            dictionary_page(),
+        ),
         width="100%",
         spacing="3",
     )
@@ -3051,6 +4834,7 @@ def index() -> rx.Component:
                 rx.vstack(
                     rx.heading(AnkiAppState.current_page_label, size="7"),
                     rx.text(AnkiAppState.current_page_description, color=ThemeStyles["MutedText"]),
+                    app_flow_header(),
                     busy_banner(),
                     status_banner(),
                     page_content(),
@@ -3065,6 +4849,7 @@ def index() -> rx.Component:
             width="100%",
             spacing="0",
         ),
+        inline_add_drawer(),
         min_height="100vh",
         width="100%",
         background=ThemeStyles["AppBackground"],
