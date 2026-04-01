@@ -1,0 +1,6 @@
+reflex==0.8.28.post1
+openai>=1.40.0
+python-dotenv>=1.0.0
+jamdict>=0.1a10
+jamdict-data>=1.5.0
+genanki>=0.13.1

@@ -1,29 +1,10 @@
-import streamlit as st
-
-
-def ApplyGlobalTheme() -> None:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] {
-            border-right: 1px solid rgba(148, 163, 184, 0.20);
-            min-width: 300px;
-            max-width: 340px;
-        }
-        .block-container {
-            padding-top: 1.25rem;
-        }
-        div[data-testid="stMetric"] {
-            border: 1px solid rgba(148, 163, 184, 0.18);
-            border-radius: 12px;
-            padding: 10px;
-            background: rgba(15, 23, 42, 0.25);
-        }
-        .stButton button {
-            border-radius: 10px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
+ThemeStyles = {
+    "AppBackground": "linear-gradient(160deg, #f7f8f5 0%, #eef2e4 100%)",
+    "SidebarBackground": "#f3f5ed",
+    "SidebarBorder": "1px solid #d6ddc2",
+    "CardBackground": "rgba(255, 255, 255, 0.92)",
+    "CardBorder": "1px solid #dbe3ca",
+    "MutedText": "#4f5943",
+    "Accent": "#3e6b2f",
+    "Danger": "#b42318",
+}

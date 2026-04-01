@@ -1,39 +1,21 @@
-import streamlit as st
-
-CurrentPageStateKey = "CurrentPageKey"
-BusyActionStateKey = "BusyActionName"
+from dataclasses import dataclass
 
 
-def EnsureUiSessionState(defaultPageKey: str) -> None:
-    if CurrentPageStateKey not in st.session_state:
-        st.session_state[CurrentPageStateKey] = defaultPageKey
-    if BusyActionStateKey not in st.session_state:
-        st.session_state[BusyActionStateKey] = ""
+@dataclass
+class BusyState:
+    ActionName: str = ""
+
+    @property
+    def IsBusy(self) -> bool:
+        return bool(self.ActionName.strip())
 
 
-def GetCurrentPageKey(defaultPageKey: str) -> str:
-    return st.session_state.get(CurrentPageStateKey, defaultPageKey)
-
-
-def SetCurrentPageKey(pageKey: str) -> None:
-    st.session_state[CurrentPageStateKey] = pageKey
-
-
-def IsBusy() -> bool:
-    return bool(st.session_state.get(BusyActionStateKey, ""))
-
-
-def GetBusyActionName() -> str:
-    return st.session_state.get(BusyActionStateKey, "")
-
-
-def BeginBusyAction(actionName: str) -> bool:
-    if IsBusy():
+def BeginBusyAction(state: BusyState, actionName: str) -> bool:
+    if state.IsBusy:
         return False
-    st.session_state[BusyActionStateKey] = actionName
-    return True
+    state.ActionName = (actionName or "").strip()
+    return bool(state.ActionName)
 
 
-def EndBusyAction() -> None:
-    st.session_state[BusyActionStateKey] = ""
-
+def EndBusyAction(state: BusyState) -> None:
+    state.ActionName = ""

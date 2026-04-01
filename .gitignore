@@ -1,3 +1,9 @@
+__pycache__/
+.states
+*.py[cod]
+*.db
+.web
+assets/external/
 *.csv
 anki_workspace/media/**
 anki_workspace/exports/**
