@@ -40,7 +40,9 @@ def main() -> None:
     currentPageKey = GetCurrentPageKey(defaultPageKey)
 
     st.title(AppTitle)
-    st.caption("Build Japanese decks with jamdict-backed cards, image scanning, review, and Anki export.")
+    st.caption(
+        "Build Japanese decks with jamdict-backed cards, global card pool reuse, image scanning, review, and Anki export."
+    )
 
     if IsBusy():
         st.warning(f"Processing: {GetBusyActionName()}")

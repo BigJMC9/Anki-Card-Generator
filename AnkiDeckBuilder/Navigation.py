@@ -32,8 +32,14 @@ PageDefinitions: List[PageDefinition] = [
     ),
     PageDefinition(
         "AddCards",
-        "Add Cards",
-        "Search jamdict and add dictionary-referenced cards.",
+        "Search Dictionary / Add Cards",
+        "Search jamdict and add selected entries to global pool or decks.",
+        "Build",
+    ),
+    PageDefinition(
+        "GlobalCards",
+        "Global Card Pool",
+        "Manage reusable global cards and import between global pool and decks.",
         "Build",
     ),
     PageDefinition(

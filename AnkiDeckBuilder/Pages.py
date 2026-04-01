@@ -10,6 +10,8 @@ from AnkiDeckBuilder.AppConfig import CardSchemas, DefaultModel
 from AnkiDeckBuilder.CsvService import ImportCsvCards
 from AnkiDeckBuilder.DatabaseService import (
     AddCard,
+    AddGlobalCard,
+    CountGlobalCards,
     CountCardsInDeck,
     CreateCollection,
     CreateDeck,
@@ -18,6 +20,9 @@ from AnkiDeckBuilder.DatabaseService import (
     DeckHasKanjiWordForm,
     GetDashboardRows,
     GetDeckCards,
+    ImportDeckCardsToGlobal,
+    ImportGlobalCardsToDeck,
+    ListGlobalCards,
     GetTotalCardCount,
     GetTotalDeckCount,
     ListCollections,
@@ -32,6 +37,7 @@ from AnkiDeckBuilder.DatabaseService import (
 from AnkiDeckBuilder.ExportService import ExportDeckPackage
 from AnkiDeckBuilder.JamdictService import (
     BuildCardFromDictionaryEntry,
+    BuildGlobalCardFromDictionaryEntry,
     FormatDictionaryEntryOption,
     GetVerbFormOptions,
     IsVerbEntry,
@@ -47,12 +53,38 @@ from AnkiDeckBuilder.WorkspaceService import CopyUploadedMedia
 
 AddCardsResultsStateKey = "AddCardsSearchResults"
 AddCardsQueryStateKey = "AddCardsSearchQuery"
+GlobalCardsResultsStateKey = "GlobalCardsSearchResults"
+GlobalCardsQueryStateKey = "GlobalCardsSearchQuery"
+GlobalCardsSelectionStateKey = "GlobalCardsSelection"
 JapaneseSegmentPattern = re.compile(r"[一-龯々〆ヶぁ-ゖァ-ヺー]+")
 KanjiOnlyPattern = re.compile(r"^[一-龯々〆ヶ]+$")
 KanaOnlyPattern = re.compile(r"^[ぁ-ゖァ-ヺー]+$")
 NumeralKanjiPattern = re.compile(r"[一二三四五六七八九十百千万〇零]")
 NumericFunCompoundPattern = re.compile(r"^[一二三四五六七八九十百千万〇零]+分$")
 ScanExpressionConnectors = ("の", "ノ", "/", "／")
+
+GlobalCardManualFieldState = {
+    "kanji": "GlobalCardFormKanji",
+    "kana": "GlobalCardFormKana",
+    "english": "GlobalCardFormEnglish",
+    "notes": "GlobalCardFormNotes",
+    "kanji_masu": "GlobalCardFormKanjiMasu",
+    "kana_masu": "GlobalCardFormKanaMasu",
+    "kanji_te": "GlobalCardFormKanjiTe",
+    "kana_te": "GlobalCardFormKanaTe",
+    "kanji_past": "GlobalCardFormKanjiPast",
+    "kana_past": "GlobalCardFormKanaPast",
+    "kanji_negative": "GlobalCardFormKanjiNegative",
+    "kana_negative": "GlobalCardFormKanaNegative",
+}
+GlobalCardDictionaryFieldState = {
+    "dictionary_entry_id": "GlobalCardFormDictionaryEntryId",
+    "dictionary_headword": "GlobalCardFormDictionaryHeadword",
+    "dictionary_reading": "GlobalCardFormDictionaryReading",
+    "dictionary_gloss": "GlobalCardFormDictionaryGloss",
+    "dictionary_pos": "GlobalCardFormDictionaryPos",
+    "verb_type": "GlobalCardFormVerbType",
+}
 
 
 def FormatDeckLabel(deck: Dict[str, Any]) -> str:
@@ -72,6 +104,43 @@ def ChooseDeck(connection: sqlite3.Connection, keyPrefix: str) -> Optional[Dict[
         key=f"{keyPrefix}_DeckSelect",
         format_func=FormatDeckLabel,
     )
+
+
+def SearchDictionaryLive(query: str, resultStateKey: str, limit: int = 30) -> List[Dict[str, Any]]:
+    normalizedQuery = (query or "").strip()
+    cacheState = st.session_state.get(resultStateKey, {})
+    cachedQuery = cacheState.get("query", "")
+    cachedResults = cacheState.get("results", [])
+
+    if not normalizedQuery:
+        st.session_state[resultStateKey] = {"query": "", "results": []}
+        return []
+
+    if normalizedQuery == cachedQuery:
+        return cachedResults
+
+    try:
+        entries = SearchDictionaryEntries(normalizedQuery, limit=limit)
+    except Exception as exc:
+        st.error(str(exc))
+        entries = []
+    st.session_state[resultStateKey] = {"query": normalizedQuery, "results": entries}
+    return entries
+
+
+def EnsureGlobalCardFormState() -> None:
+    for stateKey in GlobalCardManualFieldState.values():
+        st.session_state.setdefault(stateKey, "")
+    for stateKey in GlobalCardDictionaryFieldState.values():
+        st.session_state.setdefault(stateKey, "")
+
+
+def SetGlobalCardFormStateFromDictionary(entry: Dict[str, Any]) -> None:
+    payload = BuildGlobalCardFromDictionaryEntry(entry, tags=["manual", "global_pool"])
+    for fieldName, stateKey in GlobalCardManualFieldState.items():
+        st.session_state[stateKey] = payload.get(fieldName, "")
+    for fieldName, stateKey in GlobalCardDictionaryFieldState.items():
+        st.session_state[stateKey] = payload.get(fieldName, "")
 
 
 def BuildProgressUpdater(progressBar):
@@ -97,11 +166,13 @@ def RenderDashboardPage(connection: sqlite3.Connection) -> None:
     collections = ListCollections(connection)
     totalDecks = GetTotalDeckCount(connection)
     totalCards = GetTotalCardCount(connection)
+    totalGlobalCards = CountGlobalCards(connection)
 
-    metricOne, metricTwo, metricThree = st.columns(3)
+    metricOne, metricTwo, metricThree, metricFour = st.columns(4)
     metricOne.metric("Collections", len(collections))
     metricTwo.metric("Decks", totalDecks)
-    metricThree.metric("Cards", totalCards)
+    metricThree.metric("Deck Cards", totalCards)
+    metricFour.metric("Global Cards", totalGlobalCards)
 
     rows = GetDashboardRows(connection)
     if rows:
@@ -179,114 +250,417 @@ def RenderDeckEditorPage(connection: sqlite3.Connection) -> None:
                         st.error("A deck with that name already exists in this collection.")
 
 
-def SearchAndRenderDictionaryOptions() -> List[Dict[str, Any]]:
-    st.markdown("### Dictionary search")
-    searchColumns = st.columns([4.0, 1.0])
-    with searchColumns[0]:
-        query = st.text_input(
-            "Search word",
-            key=AddCardsQueryStateKey,
-            placeholder="Type kanji or kana (example: 食べる, たべる, 勉強)",
-        )
-    with searchColumns[1]:
-        searchClicked = st.button("Search", width="stretch")
-
-    if searchClicked:
-        normalizedQuery = (query or "").strip()
-        if not normalizedQuery:
-            st.warning("Enter a word to search.")
-            st.session_state[AddCardsResultsStateKey] = []
-        else:
-            try:
-                st.session_state[AddCardsResultsStateKey] = SearchDictionaryEntries(normalizedQuery, limit=30)
-            except Exception as exc:
-                st.session_state[AddCardsResultsStateKey] = []
-                st.error(str(exc))
-
-    return st.session_state.get(AddCardsResultsStateKey, [])
-
-
-def RenderAddCardsPage(connection: sqlite3.Connection) -> None:
-    deck = ChooseDeck(connection, "AddCards")
-    if deck is None:
-        return
-
-    schemaKey = st.selectbox(
-        "Card format",
-        list(CardSchemas.keys()),
-        format_func=lambda key: CardSchemas[key]["Label"],
-        key="AddCardsSchema",
+def SearchAndRenderDictionaryOptions(
+    queryStateKey: str,
+    resultStateKey: str,
+    selectionStateKey: str,
+) -> List[Dict[str, Any]]:
+    query = st.text_input(
+        "Search word",
+        key=queryStateKey,
+        placeholder="Type kanji or kana (example: 食べる, たべる, 勉強)",
     )
-    tagsText = st.text_input("Extra tags (comma separated)", value="japanese,manual", key="AddCardsTags")
-    extraTags = [tag.strip() for tag in tagsText.split(",") if tag.strip()]
-
-    entries = SearchAndRenderDictionaryOptions()
+    entries = SearchDictionaryLive(query, resultStateKey, limit=50)
+    if not query.strip():
+        st.caption("Start typing to search jamdict.")
+        return []
     if not entries:
-        st.info("Search jamdict and select an entry to add a card.")
-        return
+        st.info("No dictionary entries found for this search.")
+        return []
 
     optionById = {entry["entry_id"]: entry for entry in entries if entry.get("entry_id")}
     optionIds = list(optionById.keys())
     if not optionIds:
         st.warning("Dictionary returned entries without IDs; try a different search.")
-        return
+        return []
 
-    selectedEntryId = st.selectbox(
+    selectedEntryIds = st.multiselect(
         "Dictionary entries",
         optionIds,
         format_func=lambda entryId: FormatDictionaryEntryOption(optionById[entryId]),
-        key="AddCardsEntrySelect",
+        key=selectionStateKey,
     )
-    selectedEntry = optionById[selectedEntryId]
+    return [optionById[entryId] for entryId in selectedEntryIds if entryId in optionById]
 
-    wordFormOptions = GetVerbFormOptions(selectedEntry)
-    requestedWordForm = st.selectbox(
-        "Word form",
-        wordFormOptions,
-        format_func=lambda key: VerbFormLabels[key],
-        key=f"AddCardsWordForm_{selectedEntryId}",
+
+def RenderAddCardsPage(connection: sqlite3.Connection) -> None:
+    st.markdown("### Live dictionary search")
+    selectedEntries = SearchAndRenderDictionaryOptions(
+        AddCardsQueryStateKey,
+        AddCardsResultsStateKey,
+        "AddCardsSelectedEntryIds",
     )
-    if not IsVerbEntry(selectedEntry):
-        st.caption("Selected entry is not a verb. Plain dictionary form will be used.")
+    if not selectedEntries:
+        st.info("Search jamdict and select one or more entries.")
+        return
+
+    destination = st.radio(
+        "Add selected entries to",
+        ["Global pool", "Deck"],
+        key="AddCardsDestination",
+        horizontal=True,
+    )
+    tagsText = st.text_input(
+        "Extra tags (comma separated)",
+        value="japanese,manual",
+        key="AddCardsTags",
+    )
+    extraTags = [tag.strip() for tag in tagsText.split(",") if tag.strip()]
+    notes = st.text_area("Notes (optional)", value="", key="AddCardsNotes")
+    englishOverride = st.text_input("English override for all selected entries (optional)", key="AddCardsEnglish")
+
+    selectedDeck: Optional[Dict[str, Any]] = None
+    schemaKey = "kana_kanji_front_english_back"
+    requestedWordForm = "dictionary"
+    if destination == "Deck":
+        selectedDeck = ChooseDeck(connection, "AddCards")
+        if selectedDeck is None:
+            return
+        schemaKey = st.selectbox(
+            "Card format",
+            list(CardSchemas.keys()),
+            format_func=lambda key: CardSchemas[key]["Label"],
+            key="AddCardsSchema",
+        )
+        requestedWordForm = st.selectbox(
+            "Word form for verbs",
+            list(VerbFormLabels.keys()),
+            format_func=lambda key: VerbFormLabels[key],
+            key="AddCardsWordForm",
+        )
+
+    previewEntry = selectedEntries[0]
+    st.caption(f"Selected entries: {len(selectedEntries)}")
+    st.markdown("### Preview (first selected entry)")
+    if destination == "Global pool":
+        previewGlobalCard = BuildGlobalCardFromDictionaryEntry(
+            previewEntry,
+            tags=extraTags,
+            notes=notes,
+            englishOverride=englishOverride,
+        )
+        st.write(
+            {
+                "kanji": previewGlobalCard["kanji"],
+                "kana": previewGlobalCard["kana"],
+                "english": previewGlobalCard["english"],
+                "masu": f"{previewGlobalCard['kanji_masu']} [{previewGlobalCard['kana_masu']}]",
+                "te": f"{previewGlobalCard['kanji_te']} [{previewGlobalCard['kana_te']}]",
+                "past": f"{previewGlobalCard['kanji_past']} [{previewGlobalCard['kana_past']}]",
+                "negative": (
+                    f"{previewGlobalCard['kanji_negative']} [{previewGlobalCard['kana_negative']}]"
+                ),
+                "dictionary_entry_id": previewGlobalCard["dictionary_entry_id"],
+            }
+        )
     else:
-        st.caption(f"Verb type: {selectedEntry.get('verb_type_label', 'Verb')}")
-
-    englishOverride = st.text_input(
-        "English (optional override)",
-        value=selectedEntry.get("english", ""),
-        key=f"AddCardsEnglishOverride_{selectedEntryId}",
-    )
-    notes = st.text_area(
-        "Notes (optional)",
-        value="",
-        key=f"AddCardsNotes_{selectedEntryId}",
-    )
-
-    previewCard = BuildCardFromDictionaryEntry(
-        selectedEntry,
-        schemaKey,
-        requestedWordForm,
-        extraTags,
-        notes,
-        englishOverride=englishOverride,
-    )
-    st.markdown("### Card preview")
-    st.write(
-        {
-            "kanji": previewCard["kanji"],
-            "kana": previewCard["kana"],
-            "english": previewCard["english"],
-            "word_form": previewCard["word_form"],
-            "dictionary_entry_id": previewCard["dictionary_entry_id"],
-        }
-    )
-
-    if st.button("Add selected dictionary entry", disabled=IsBusy(), width="stretch", type="primary"):
-        isAdded = AddCard(connection, deck["id"], previewCard)
-        if isAdded:
-            st.success("Card added.")
+        previewDeckCard = BuildCardFromDictionaryEntry(
+            previewEntry,
+            schemaKey,
+            requestedWordForm,
+            extraTags,
+            notes,
+            englishOverride=englishOverride,
+        )
+        st.write(
+            {
+                "kanji": previewDeckCard["kanji"],
+                "kana": previewDeckCard["kana"],
+                "english": previewDeckCard["english"],
+                "word_form": previewDeckCard["word_form"],
+                "dictionary_entry_id": previewDeckCard["dictionary_entry_id"],
+            }
+        )
+        if not IsVerbEntry(previewEntry):
+            st.caption("Selected preview entry is not a verb. Plain dictionary form is used.")
         else:
-            st.warning("Duplicate card skipped.")
+            st.caption(f"Verb type: {previewEntry.get('verb_type_label', 'Verb')}")
+
+    actionLabel = "Add selected entries to global pool" if destination == "Global pool" else "Add selected entries to deck"
+    if st.button(actionLabel, disabled=IsBusy(), width="stretch", type="primary"):
+        added = 0
+        skipped = 0
+        for entry in selectedEntries:
+            if destination == "Global pool":
+                card = BuildGlobalCardFromDictionaryEntry(
+                    entry,
+                    tags=extraTags,
+                    notes=notes,
+                    englishOverride=englishOverride,
+                )
+                isAdded = AddGlobalCard(connection, card)
+            else:
+                card = BuildCardFromDictionaryEntry(
+                    entry,
+                    schemaKey,
+                    requestedWordForm,
+                    extraTags,
+                    notes,
+                    englishOverride=englishOverride,
+                )
+                if selectedDeck is None:
+                    isAdded = False
+                else:
+                    isAdded = AddCard(connection, selectedDeck["id"], card)
+
+            added += int(isAdded)
+            skipped += int(not isAdded)
+
+        st.success(f"Added {added} card(s); skipped {skipped} duplicate/invalid card(s).")
+
+
+def RenderGlobalCardsPage(connection: sqlite3.Connection) -> None:
+    EnsureGlobalCardFormState()
+    totalGlobalCards = CountGlobalCards(connection)
+    st.metric("Global cards", totalGlobalCards)
+
+    st.markdown("### Autofill global card form from dictionary")
+    autofillEntries = SearchAndRenderDictionaryOptions(
+        GlobalCardsQueryStateKey,
+        GlobalCardsResultsStateKey,
+        "GlobalCardsAutofillEntryIds",
+    )
+    if autofillEntries:
+        if st.button(
+            "Autofill form from first selected dictionary entry",
+            key="GlobalCardsAutofillButton",
+            width="stretch",
+        ):
+            SetGlobalCardFormStateFromDictionary(autofillEntries[0])
+            st.success("Global card form fields were filled from dictionary data.")
+            st.rerun()
+
+    st.markdown("### Add global card manually")
+    with st.form("GlobalCardForm"):
+        kanji = st.text_input(
+            "Kanji + Okurigana (required)",
+            key=GlobalCardManualFieldState["kanji"],
+        )
+        kana = st.text_input(
+            "Kana (Hiragana/Katakana) (required)",
+            key=GlobalCardManualFieldState["kana"],
+        )
+        english = st.text_input(
+            "English translation (required)",
+            key=GlobalCardManualFieldState["english"],
+        )
+        notes = st.text_area(
+            "Notes (optional)",
+            key=GlobalCardManualFieldState["notes"],
+        )
+
+        st.markdown("#### Optional verb forms")
+        formColumnsOne = st.columns(2)
+        with formColumnsOne[0]:
+            st.text_input("Masu (kanji)", key=GlobalCardManualFieldState["kanji_masu"])
+        with formColumnsOne[1]:
+            st.text_input("Masu (kana)", key=GlobalCardManualFieldState["kana_masu"])
+        formColumnsTwo = st.columns(2)
+        with formColumnsTwo[0]:
+            st.text_input("Te (kanji)", key=GlobalCardManualFieldState["kanji_te"])
+        with formColumnsTwo[1]:
+            st.text_input("Te (kana)", key=GlobalCardManualFieldState["kana_te"])
+        formColumnsThree = st.columns(2)
+        with formColumnsThree[0]:
+            st.text_input("Past (kanji)", key=GlobalCardManualFieldState["kanji_past"])
+        with formColumnsThree[1]:
+            st.text_input("Past (kana)", key=GlobalCardManualFieldState["kana_past"])
+        formColumnsFour = st.columns(2)
+        with formColumnsFour[0]:
+            st.text_input("Negative / nai (kanji)", key=GlobalCardManualFieldState["kanji_negative"])
+        with formColumnsFour[1]:
+            st.text_input("Negative / nai (kana)", key=GlobalCardManualFieldState["kana_negative"])
+
+        st.markdown("#### Optional media")
+        imageUploads = st.file_uploader(
+            "Images (optional)",
+            accept_multiple_files=True,
+            type=["png", "jpg", "jpeg", "webp"],
+            key="GlobalCardImageUploads",
+        )
+        videoUploads = st.file_uploader(
+            "Videos (optional)",
+            accept_multiple_files=True,
+            type=["mp4", "webm", "mov"],
+            key="GlobalCardVideoUploads",
+        )
+        tagsText = st.text_input(
+            "Tags (comma separated)",
+            value="japanese,global_pool",
+            key="GlobalCardTags",
+        )
+
+        with st.expander("Dictionary reference metadata (optional)"):
+            st.text_input("Dictionary entry id", key=GlobalCardDictionaryFieldState["dictionary_entry_id"])
+            st.text_input("Dictionary headword", key=GlobalCardDictionaryFieldState["dictionary_headword"])
+            st.text_input("Dictionary reading", key=GlobalCardDictionaryFieldState["dictionary_reading"])
+            st.text_input("Dictionary gloss", key=GlobalCardDictionaryFieldState["dictionary_gloss"])
+            st.text_input("Dictionary part of speech", key=GlobalCardDictionaryFieldState["dictionary_pos"])
+            st.text_input("Verb type", key=GlobalCardDictionaryFieldState["verb_type"])
+
+        submitted = st.form_submit_button(
+            "Add global card",
+            disabled=IsBusy(),
+            type="primary",
+        )
+        if submitted:
+            normalizedKanji = (kanji or "").strip()
+            normalizedKana = (kana or "").strip()
+            normalizedEnglish = (english or "").strip()
+            if not normalizedKanji or not normalizedKana or not normalizedEnglish:
+                st.error("Kanji + okurigana, kana, and english are required.")
+            else:
+                savedImagePaths = [CopyUploadedMedia(upload, "_global_pool") for upload in imageUploads or []]
+                savedVideoPaths = [CopyUploadedMedia(upload, "_global_pool") for upload in videoUploads or []]
+                payload = {
+                    "kanji": normalizedKanji,
+                    "kana": normalizedKana,
+                    "english": normalizedEnglish,
+                    "notes": (notes or "").strip(),
+                    "kanji_masu": st.session_state[GlobalCardManualFieldState["kanji_masu"]],
+                    "kana_masu": st.session_state[GlobalCardManualFieldState["kana_masu"]],
+                    "kanji_te": st.session_state[GlobalCardManualFieldState["kanji_te"]],
+                    "kana_te": st.session_state[GlobalCardManualFieldState["kana_te"]],
+                    "kanji_past": st.session_state[GlobalCardManualFieldState["kanji_past"]],
+                    "kana_past": st.session_state[GlobalCardManualFieldState["kana_past"]],
+                    "kanji_negative": st.session_state[GlobalCardManualFieldState["kanji_negative"]],
+                    "kana_negative": st.session_state[GlobalCardManualFieldState["kana_negative"]],
+                    "image_files": savedImagePaths,
+                    "video_files": savedVideoPaths,
+                    "tags": [tag.strip() for tag in tagsText.split(",") if tag.strip()],
+                    "dictionary_entry_id": st.session_state[GlobalCardDictionaryFieldState["dictionary_entry_id"]],
+                    "dictionary_headword": st.session_state[GlobalCardDictionaryFieldState["dictionary_headword"]],
+                    "dictionary_reading": st.session_state[GlobalCardDictionaryFieldState["dictionary_reading"]],
+                    "dictionary_gloss": st.session_state[GlobalCardDictionaryFieldState["dictionary_gloss"]],
+                    "dictionary_pos": st.session_state[GlobalCardDictionaryFieldState["dictionary_pos"]],
+                    "verb_type": st.session_state[GlobalCardDictionaryFieldState["verb_type"]],
+                }
+                isAdded = AddGlobalCard(connection, payload)
+                if isAdded:
+                    st.success("Global card added.")
+                    st.rerun()
+                else:
+                    st.warning("Global card skipped (duplicate or invalid).")
+
+    st.markdown("### Import deck cards into global pool")
+    deckOptions = ListDecks(connection, includeCollectionName=True)
+    if not deckOptions:
+        st.info("Create a deck first to use deck/global import actions.")
+    else:
+        sourceDeck = st.selectbox(
+            "Source deck",
+            deckOptions,
+            format_func=FormatDeckLabel,
+            key="GlobalCardsSourceDeck",
+        )
+        if st.button(
+            "Import all cards from selected deck to global pool",
+            key="GlobalCardsImportFromDeckButton",
+            width="stretch",
+            disabled=IsBusy(),
+        ):
+            added, skipped = ImportDeckCardsToGlobal(connection, sourceDeck["id"])
+            st.success(f"Imported {added} card(s) from deck; skipped {skipped} duplicate/invalid card(s).")
+            st.rerun()
+
+    globalCards = ListGlobalCards(connection)
+    st.markdown("### Global card browser")
+    if not globalCards:
+        st.info("No global cards yet.")
+        return
+
+    searchText = st.text_input(
+        "Search global cards",
+        key="GlobalCardsSearchText",
+        placeholder="Search kanji, kana, english, dictionary id",
+    ).strip()
+    filteredGlobalCards: List[sqlite3.Row] = []
+    for row in globalCards:
+        searchable = " ".join(
+            [
+                row["kanji"] or "",
+                row["kana"] or "",
+                row["english"] or "",
+                row["dictionary_entry_id"] or "",
+            ]
+        ).lower()
+        if not searchText or searchText.lower() in searchable:
+            filteredGlobalCards.append(row)
+
+    if not filteredGlobalCards:
+        st.info("No global cards match the current search.")
+        return
+
+    tableRows = [
+        {
+            "kanji": row["kanji"],
+            "kana": row["kana"],
+            "english": row["english"],
+            "dictionary_entry_id": row["dictionary_entry_id"] or "",
+            "masu": row["kanji_masu"] or "",
+            "te": row["kanji_te"] or "",
+            "past": row["kanji_past"] or "",
+            "negative": row["kanji_negative"] or "",
+        }
+        for row in filteredGlobalCards
+    ]
+    st.dataframe(pd.DataFrame(tableRows), width="stretch", hide_index=True)
+
+    optionById = {row["id"]: row for row in filteredGlobalCards}
+    selectedGlobalCardIds = st.multiselect(
+        "Select global cards",
+        list(optionById.keys()),
+        format_func=lambda cardId: (
+            f"{optionById[cardId]['kanji']} [{optionById[cardId]['kana']}] - {optionById[cardId]['english']}"
+        ),
+        key=GlobalCardsSelectionStateKey,
+    )
+    st.caption(f"Selected global cards: {len(selectedGlobalCardIds)}")
+
+    if not deckOptions:
+        return
+
+    st.markdown("### Import selected global cards into a deck")
+    destinationDeck = st.selectbox(
+        "Destination deck",
+        deckOptions,
+        format_func=FormatDeckLabel,
+        key="GlobalCardsDestinationDeck",
+    )
+    schemaKey = st.selectbox(
+        "Card format on import",
+        list(CardSchemas.keys()),
+        format_func=lambda key: CardSchemas[key]["Label"],
+        key="GlobalCardsDestinationSchema",
+    )
+    requestedWordForm = st.selectbox(
+        "Word form on import",
+        list(VerbFormLabels.keys()),
+        format_func=lambda key: VerbFormLabels[key],
+        key="GlobalCardsDestinationWordForm",
+    )
+    importTagsText = st.text_input(
+        "Extra tags for deck import (comma separated)",
+        value="japanese,global_import",
+        key="GlobalCardsImportTags",
+    )
+    importTags = [tag.strip() for tag in importTagsText.split(",") if tag.strip()]
+    if st.button(
+        "Import selected global cards into deck",
+        key="GlobalCardsImportToDeckButton",
+        width="stretch",
+        type="primary",
+        disabled=IsBusy() or not selectedGlobalCardIds,
+    ):
+        added, skipped = ImportGlobalCardsToDeck(
+            connection,
+            destinationDeck["id"],
+            selectedGlobalCardIds,
+            schemaKey,
+            requestedWordForm,
+            extraTags=importTags,
+        )
+        st.success(f"Imported {added} card(s) into deck; skipped {skipped} duplicate/invalid card(s).")
 
 
 def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
@@ -865,6 +1239,7 @@ PageRendererByKey = {
     "CreateCollections": RenderCollectionEditorPage,
     "CreateDecks": RenderDeckEditorPage,
     "AddCards": RenderAddCardsPage,
+    "GlobalCards": RenderGlobalCardsPage,
     "ReviewCards": RenderReviewCardsPage,
     "ScanImages": RenderScanImagesPage,
     "ImportCsv": RenderImportCsvPage,

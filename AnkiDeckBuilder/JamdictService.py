@@ -557,6 +557,63 @@ def BuildCardFromDictionaryEntry(
     }
 
 
+def BuildConjugatedForms(entry: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    forms: Dict[str, Dict[str, str]] = {}
+    for wordForm in VerbFormLabels.keys():
+        kanji, kana, appliedWordForm = ResolveWordSurface(entry, wordForm)
+        forms[appliedWordForm] = {
+            "kanji": NormalizeText(kanji),
+            "kana": NormalizeText(kana),
+        }
+    return forms
+
+
+def BuildGlobalCardFromDictionaryEntry(
+    entry: Dict[str, Any],
+    tags: Optional[List[str]] = None,
+    notes: str = "",
+    englishOverride: str = "",
+) -> Dict[str, Any]:
+    forms = BuildConjugatedForms(entry)
+    dictionarySurface = forms.get(
+        "dictionary",
+        {
+            "kanji": NormalizeText(entry.get("headword", "")),
+            "kana": NormalizeText(entry.get("reading", "")),
+        },
+    )
+    english = NormalizeText(englishOverride) or NormalizeText(entry.get("english", ""))
+
+    masuSurface = forms.get("masu", {})
+    teSurface = forms.get("te", {})
+    pastSurface = forms.get("past", {})
+    negativeSurface = forms.get("negative", {})
+
+    return {
+        "kanji": dictionarySurface.get("kanji", ""),
+        "kana": dictionarySurface.get("kana", ""),
+        "english": english,
+        "notes": NormalizeText(notes),
+        "kanji_masu": masuSurface.get("kanji", ""),
+        "kana_masu": masuSurface.get("kana", ""),
+        "kanji_te": teSurface.get("kanji", ""),
+        "kana_te": teSurface.get("kana", ""),
+        "kanji_past": pastSurface.get("kanji", ""),
+        "kana_past": pastSurface.get("kana", ""),
+        "kanji_negative": negativeSurface.get("kanji", ""),
+        "kana_negative": negativeSurface.get("kana", ""),
+        "image_files": [],
+        "video_files": [],
+        "tags": sorted(set((tags or []) + ["jamdict"])),
+        "dictionary_entry_id": entry.get("entry_id", ""),
+        "dictionary_headword": entry.get("headword", ""),
+        "dictionary_reading": entry.get("reading", ""),
+        "dictionary_gloss": entry.get("english", ""),
+        "dictionary_pos": ", ".join(entry.get("pos_labels", [])),
+        "verb_type": entry.get("verb_type", ""),
+    }
+
+
 def ScoreDictionaryMatch(
     entry: Dict[str, Any],
     query: str,
