@@ -91,7 +91,7 @@ def RenderDashboardPage(connection: sqlite3.Connection) -> None:
     rows = GetDashboardRows(connection)
     if rows:
         rowDictionaryList = [dict(row) for row in rows]
-        st.dataframe(pd.DataFrame(rowDictionaryList), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rowDictionaryList), width="stretch", hide_index=True)
     else:
         st.info("Create a collection and a deck to get started.")
 
@@ -289,11 +289,11 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
 
     selectColumn, clearColumn = st.columns(2)
     with selectColumn:
-        if st.button("Select all cards", disabled=IsBusy(), use_container_width=True):
+        if st.button("Select all cards", disabled=IsBusy(), width="stretch"):
             st.session_state[selectionStateKey] = {cardId: True for cardId in cardById}
             st.rerun()
     with clearColumn:
-        if st.button("Clear selection", disabled=IsBusy(), use_container_width=True):
+        if st.button("Clear selection", disabled=IsBusy(), width="stretch"):
             st.session_state[selectionStateKey] = {cardId: False for cardId in cardById}
             st.rerun()
 
@@ -330,7 +330,7 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
     editedFrame = st.data_editor(
         browserFrame,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key=f"ReviewCardBrowser_{deck['id']}",
         disabled=["CardId", "Index", "Kanji", "Kana", "English", "Format", "Notes"],
         column_config={
@@ -372,14 +372,14 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         applySubmitted = st.button(
             "Apply selected changes",
             disabled=IsBusy() or not selectedCardIds,
-            use_container_width=True,
+            width="stretch",
             type="primary",
         )
     with verifyColumn:
         verifySubmitted = st.button(
             "Verify selected cards",
             disabled=IsBusy() or not selectedCardIds,
-            use_container_width=True,
+            width="stretch",
         )
     with confirmDeleteColumn:
         confirmDelete = st.checkbox(
@@ -390,7 +390,7 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         deleteSubmitted = st.button(
             "Delete selected cards",
             disabled=IsBusy() or not selectedCardIds or not confirmDelete,
-            use_container_width=True,
+            width="stretch",
         )
 
     if applySubmitted:
@@ -717,12 +717,12 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
             }
             for upload in uploads
         ]
-        st.dataframe(pd.DataFrame(fileRows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(fileRows), width="stretch", hide_index=True)
 
     if st.button(
         "Scan images and add missing cards",
         disabled=IsBusy() or not uploads,
-        use_container_width=True,
+        width="stretch",
     ):
         if not BeginBusyAction("Scanning images and adding missing cards"):
             st.warning("A request is already in progress.")
@@ -780,7 +780,7 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
                 f"Scanned {len(uploads)} images. Added {added} new cards and skipped {duplicates} duplicates."
             )
             if extractedCards:
-                st.dataframe(pd.DataFrame(extractedCards), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(extractedCards), width="stretch", hide_index=True)
             missingEnglishCount = sum(1 for card in extractedCards if not (card.get("english") or "").strip())
             if missingEnglishCount > 0:
                 st.warning(f"{missingEnglishCount} extracted card(s) are still missing English translations.")
@@ -802,7 +802,7 @@ def RenderImportCsvPage(connection: sqlite3.Connection) -> None:
     if st.button(
         "Import CSV cards",
         disabled=IsBusy() or uploaded is None,
-        use_container_width=True,
+        width="stretch",
     ):
         if not BeginBusyAction("Importing CSV cards"):
             st.warning("A request is already in progress.")
@@ -827,7 +827,7 @@ def RenderExportPage(connection: sqlite3.Connection) -> None:
     if CountCardsInDeck(connection, deck["id"]) == 0:
         st.info("This deck has no cards yet.")
 
-    if st.button("Build .apkg", disabled=IsBusy(), use_container_width=True):
+    if st.button("Build .apkg", disabled=IsBusy(), width="stretch"):
         if not BeginBusyAction("Exporting Anki package"):
             st.warning("A request is already in progress.")
             return
