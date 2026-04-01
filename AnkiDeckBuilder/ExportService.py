@@ -46,6 +46,23 @@ def RenderMedia(card: sqlite3.Row) -> str:
     return "<br>".join(tags)
 
 
+def RenderDictionaryReference(card: sqlite3.Row) -> str:
+    entryId = (card["dictionary_entry_id"] or "").strip()
+    if not entryId:
+        return ""
+
+    headword = html.escape((card["dictionary_headword"] or "").strip())
+    reading = html.escape((card["dictionary_reading"] or "").strip())
+    gloss = html.escape((card["dictionary_gloss"] or "").strip())
+    wordForm = html.escape((card["word_form"] or "").strip())
+
+    summary = f"{headword} [{reading}]".strip() if reading else headword
+    detailParts = [item for item in [summary, gloss] if item]
+    detail = " - ".join(detailParts)
+    formText = f" | form: {wordForm}" if wordForm else ""
+    return f"<small>JMDict #{html.escape(entryId)}: {detail}{formText}</small>"
+
+
 def BuildNoteFields(card: sqlite3.Row) -> Tuple[str, str, str]:
     schema = CardSchemas[card["schema_key"]]
 
@@ -53,6 +70,7 @@ def BuildNoteFields(card: sqlite3.Row) -> Tuple[str, str, str]:
     backParts = [RenderField(field, card) for field in schema["BackFields"] if RenderField(field, card)]
 
     mediaHtml = RenderMedia(card)
+    dictionaryReferenceHtml = RenderDictionaryReference(card)
     notes = RenderField("notes", card)
 
     frontHtml = "<br>".join(frontParts)
@@ -60,6 +78,8 @@ def BuildNoteFields(card: sqlite3.Row) -> Tuple[str, str, str]:
 
     if notes:
         backHtml += f"<hr>{notes}" if backHtml else notes
+    if dictionaryReferenceHtml:
+        backHtml += f"<hr>{dictionaryReferenceHtml}" if backHtml else dictionaryReferenceHtml
     if mediaHtml:
         backHtml += f"<hr>{mediaHtml}" if backHtml else mediaHtml
 
@@ -123,4 +143,3 @@ def ExportDeckPackage(connection: sqlite3.Connection, deckId: str) -> Path:
     package.media_files = sorted(set(mediaFiles))
     package.write_to_file(str(exportPath))
     return exportPath
-

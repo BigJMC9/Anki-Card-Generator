@@ -10,6 +10,15 @@ from AnkiDeckBuilder.AppConfig import DatabasePath
 from AnkiDeckBuilder.WorkspaceService import EnsureWorkspaceDirectories
 
 AllowedCardFieldsToUpdate = {"kanji", "kana", "english", "notes", "schema_key", "media_type"}
+CardColumnDefinitions = {
+    "dictionary_entry_id": "TEXT NOT NULL DEFAULT ''",
+    "dictionary_headword": "TEXT NOT NULL DEFAULT ''",
+    "dictionary_reading": "TEXT NOT NULL DEFAULT ''",
+    "dictionary_gloss": "TEXT NOT NULL DEFAULT ''",
+    "dictionary_pos": "TEXT NOT NULL DEFAULT ''",
+    "verb_type": "TEXT NOT NULL DEFAULT ''",
+    "word_form": "TEXT NOT NULL DEFAULT 'dictionary'",
+}
 
 
 def OpenDatabaseConnection() -> sqlite3.Connection:
@@ -56,6 +65,13 @@ def EnsureDatabaseSchema(connection: sqlite3.Connection) -> None:
             media_type TEXT NOT NULL DEFAULT 'none',
             media_files_json TEXT NOT NULL DEFAULT '[]',
             tags_json TEXT NOT NULL DEFAULT '[]',
+            dictionary_entry_id TEXT NOT NULL DEFAULT '',
+            dictionary_headword TEXT NOT NULL DEFAULT '',
+            dictionary_reading TEXT NOT NULL DEFAULT '',
+            dictionary_gloss TEXT NOT NULL DEFAULT '',
+            dictionary_pos TEXT NOT NULL DEFAULT '',
+            verb_type TEXT NOT NULL DEFAULT '',
+            word_form TEXT NOT NULL DEFAULT 'dictionary',
             unique_key TEXT NOT NULL,
             created_at REAL NOT NULL,
             UNIQUE(deck_id, unique_key),
@@ -63,7 +79,18 @@ def EnsureDatabaseSchema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    EnsureCardsTableColumns(connection)
     connection.commit()
+
+
+def EnsureCardsTableColumns(connection: sqlite3.Connection) -> None:
+    existingColumns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(cards)").fetchall()
+    }
+    for columnName, definition in CardColumnDefinitions.items():
+        if columnName in existingColumns:
+            continue
+        connection.execute(f"ALTER TABLE cards ADD COLUMN {columnName} {definition}")
 
 
 def NormalizeText(value: str) -> str:
@@ -199,6 +226,13 @@ def AddCard(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -
     kanji = (card.get("kanji") or "").strip()
     kana = (card.get("kana") or "").strip()
     english = (card.get("english") or "").strip()
+    dictionaryEntryId = (card.get("dictionary_entry_id") or "").strip()
+    dictionaryHeadword = (card.get("dictionary_headword") or "").strip()
+    dictionaryReading = (card.get("dictionary_reading") or "").strip()
+    dictionaryGloss = (card.get("dictionary_gloss") or "").strip()
+    dictionaryPos = (card.get("dictionary_pos") or "").strip()
+    verbType = (card.get("verb_type") or "").strip()
+    wordForm = (card.get("word_form") or "dictionary").strip() or "dictionary"
 
     if CardWordExistsInSchema(connection, deckId, schemaKey, kanji, kana):
         return False
@@ -209,8 +243,11 @@ def AddCard(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -
             """
             INSERT INTO cards (
                 id, deck_id, kanji, kana, english, notes, source_text, schema_key,
-                media_type, media_files_json, tags_json, unique_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                media_type, media_files_json, tags_json,
+                dictionary_entry_id, dictionary_headword, dictionary_reading,
+                dictionary_gloss, dictionary_pos, verb_type, word_form,
+                unique_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(uuid.uuid4()),
@@ -224,6 +261,13 @@ def AddCard(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -
                 card.get("media_type") or "none",
                 json.dumps(card.get("media_files") or [], ensure_ascii=False),
                 json.dumps(card.get("tags") or [], ensure_ascii=False),
+                dictionaryEntryId,
+                dictionaryHeadword,
+                dictionaryReading,
+                dictionaryGloss,
+                dictionaryPos,
+                verbType,
+                wordForm,
                 uniqueKey,
                 time.time(),
             ),
@@ -408,6 +452,37 @@ def DeckHasCandidate(connection: sqlite3.Connection, deckId: str, card: Dict[str
     kanji = card.get("kanji", "")
     kana = card.get("kana", "")
     return CardWordExistsInSchema(connection, deckId, schemaKey, kanji, kana)
+
+
+def DeckHasKanjiWordForm(
+    connection: sqlite3.Connection,
+    deckId: str,
+    schemaKey: str,
+    wordForm: str,
+    kanji: str,
+) -> bool:
+    normalizedKanji = (kanji or "").strip()
+    if not normalizedKanji:
+        return False
+
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM cards
+        WHERE deck_id = ?
+          AND schema_key = ?
+          AND word_form = ?
+          AND lower(trim(kanji)) = lower(trim(?))
+        LIMIT 1
+        """,
+        (
+            deckId,
+            (schemaKey or "").strip() or "kana_kanji_front_english_back",
+            (wordForm or "dictionary").strip() or "dictionary",
+            normalizedKanji,
+        ),
+    ).fetchone()
+    return row is not None
 
 
 def GetDashboardRows(connection: sqlite3.Connection) -> List[sqlite3.Row]:

@@ -33,13 +33,13 @@ PageDefinitions: List[PageDefinition] = [
     PageDefinition(
         "AddCards",
         "Add Cards",
-        "Generate cards from text or add cards manually.",
+        "Search jamdict and add dictionary-referenced cards.",
         "Build",
     ),
     PageDefinition(
         "ReviewCards",
         "Review Cards / Replace With Media",
-        "Edit card text and attach media replacements.",
+        "Edit card text, adjust card formats, and attach media replacements.",
         "Maintain",
     ),
     PageDefinition(
@@ -95,7 +95,7 @@ def RenderSidebarNavigation(
             if st.sidebar.button(
                 label,
                 key=f"SidebarNav_{page.Key}",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 disabled=disableNavigation,
             ):
@@ -138,7 +138,7 @@ def RenderTopNavigation(currentPageKey: str, disableNavigation: bool) -> Optiona
             f"\u2190 {previousPage.Label}",
             key=f"TopNavPrevious_{currentPageKey}",
             disabled=disableNavigation,
-            use_container_width=True,
+            width="stretch",
         ):
             selectedPageKey = previousPage.Key
 
@@ -152,7 +152,7 @@ def RenderTopNavigation(currentPageKey: str, disableNavigation: bool) -> Optiona
             f"{nextPage.Label} \u2192",
             key=f"TopNavNext_{currentPageKey}",
             disabled=disableNavigation,
-            use_container_width=True,
+            width="stretch",
         ):
             selectedPageKey = nextPage.Key
 

@@ -45,32 +45,6 @@ CardSchemas = {
 
 NoteModelId = 1894375291
 
-SystemPrompt = """
-You extract Japanese study cards from source text or OCR text.
-Return only valid JSON.
-Each card must be atomic and unambiguous.
-Prefer one concept per card.
-Use this schema:
-{
-  "cards": [
-    {
-      "kanji": "",
-      "kana": "",
-      "english": "",
-      "notes": "",
-      "source_text": "",
-      "tags": ["..."]
-    }
-  ]
-}
-Rules:
-- kana should contain hiragana or katakana reading.
-- kanji may be blank if the word truly has no kanji form.
-- english should be short and natural.
-- source_text should be the exact source span when possible.
-- skip cards that are duplicates, unclear, or not useful vocabulary.
-""".strip()
-
 ImageOcrPrompt = """
 Read the image carefully and extract Japanese words or short phrases that are clearly visible.
 Return only valid JSON with this schema:
@@ -87,7 +61,8 @@ Return only valid JSON with this schema:
 }
 Rules:
 - Only include Japanese text that is actually visible in the image.
+- Prefer canonical kanji with okurigana when visible (for example: 食べる, 行きます).
 - confidence must be between 0 and 1.
-- If kana or english are uncertain, do your best but keep visible_text exact.
+- If kana is uncertain, do your best but keep visible_text exact.
 - Do not include duplicates.
 """.strip()

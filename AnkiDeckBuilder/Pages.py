@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +15,7 @@ from AnkiDeckBuilder.DatabaseService import (
     CreateDeck,
     DeleteCardsByIds,
     DeckHasCandidate,
+    DeckHasKanjiWordForm,
     GetDashboardRows,
     GetDeckCards,
     GetTotalCardCount,
@@ -25,19 +27,32 @@ from AnkiDeckBuilder.DatabaseService import (
     UpdateCardContent,
     UpdateCardField,
     UpdateCardMedia,
+    UpdateCardsSchemaByIds,
 )
 from AnkiDeckBuilder.ExportService import ExportDeckPackage
-from AnkiDeckBuilder.OpenAiService import (
-    ConvertJapaneseWords,
-    ExtractCardsFromImages,
-    GenerateCardsFromText,
-    GenerateEnglishTranslations,
-    GetOpenAiClient,
-    SupportedWordForms,
-    VerifyCardsAgainstSelection,
+from AnkiDeckBuilder.JamdictService import (
+    BuildCardFromDictionaryEntry,
+    FormatDictionaryEntryOption,
+    GetVerbFormOptions,
+    IsVerbEntry,
+    LooksLikePoliteMasuSurface,
+    NormalizeNumericJapaneseSurface,
+    ResolveBestDictionaryEntry,
+    SearchDictionaryEntries,
+    VerbFormLabels,
 )
+from AnkiDeckBuilder.OpenAiService import ExtractCardsFromImages, GetOpenAiClient
 from AnkiDeckBuilder.UiState import BeginBusyAction, EndBusyAction, IsBusy
 from AnkiDeckBuilder.WorkspaceService import CopyUploadedMedia
+
+AddCardsResultsStateKey = "AddCardsSearchResults"
+AddCardsQueryStateKey = "AddCardsSearchQuery"
+JapaneseSegmentPattern = re.compile(r"[一-龯々〆ヶぁ-ゖァ-ヺー]+")
+KanjiOnlyPattern = re.compile(r"^[一-龯々〆ヶ]+$")
+KanaOnlyPattern = re.compile(r"^[ぁ-ゖァ-ヺー]+$")
+NumeralKanjiPattern = re.compile(r"[一二三四五六七八九十百千万〇零]")
+NumericFunCompoundPattern = re.compile(r"^[一二三四五六七八九十百千万〇零]+分$")
+ScanExpressionConnectors = ("の", "ノ", "/", "／")
 
 
 def FormatDeckLabel(deck: Dict[str, Any]) -> str:
@@ -164,37 +179,31 @@ def RenderDeckEditorPage(connection: sqlite3.Connection) -> None:
                         st.error("A deck with that name already exists in this collection.")
 
 
-def HandleTextGeneration(
-    connection: sqlite3.Connection,
-    deckId: str,
-    sourceText: str,
-    schemaKey: str,
-    extraTags: List[str],
-) -> None:
-    if not BeginBusyAction("Generating cards from text"):
-        st.warning("A request is already in progress.")
-        return
-
-    progressBar = st.progress(0, text="Preparing OpenAI request...")
-    try:
-        client = GetOpenAiClient()
-        generatedCards, errors = GenerateCardsFromText(
-            client,
-            DefaultModel,
-            sourceText,
-            schemaKey,
-            extraTags,
-            BuildProgressUpdater(progressBar),
+def SearchAndRenderDictionaryOptions() -> List[Dict[str, Any]]:
+    st.markdown("### Dictionary search")
+    searchColumns = st.columns([4.0, 1.0])
+    with searchColumns[0]:
+        query = st.text_input(
+            "Search word",
+            key=AddCardsQueryStateKey,
+            placeholder="Type kanji or kana (example: 食べる, たべる, 勉強)",
         )
-        added = sum(AddCard(connection, deckId, card) for card in generatedCards)
-        skipped = len(generatedCards) - added
-        progressBar.progress(100, text="Card generation complete.")
-        st.success(f"Generated {len(generatedCards)} candidates. Added {added}, skipped {skipped} duplicates.")
-        RenderErrorList(errors, "Some chunks could not be parsed")
-    except Exception as exc:
-        st.error(str(exc))
-    finally:
-        EndBusyAction()
+    with searchColumns[1]:
+        searchClicked = st.button("Search", width="stretch")
+
+    if searchClicked:
+        normalizedQuery = (query or "").strip()
+        if not normalizedQuery:
+            st.warning("Enter a word to search.")
+            st.session_state[AddCardsResultsStateKey] = []
+        else:
+            try:
+                st.session_state[AddCardsResultsStateKey] = SearchDictionaryEntries(normalizedQuery, limit=30)
+            except Exception as exc:
+                st.session_state[AddCardsResultsStateKey] = []
+                st.error(str(exc))
+
+    return st.session_state.get(AddCardsResultsStateKey, [])
 
 
 def RenderAddCardsPage(connection: sqlite3.Connection) -> None:
@@ -206,69 +215,78 @@ def RenderAddCardsPage(connection: sqlite3.Connection) -> None:
         "Card format",
         list(CardSchemas.keys()),
         format_func=lambda key: CardSchemas[key]["Label"],
+        key="AddCardsSchema",
     )
-    tagsText = st.text_input("Extra tags (comma separated)", value="japanese")
+    tagsText = st.text_input("Extra tags (comma separated)", value="japanese,manual", key="AddCardsTags")
     extraTags = [tag.strip() for tag in tagsText.split(",") if tag.strip()]
 
-    mode = st.radio("Source", ["Paste text", "Upload text file", "Manual single card"])
+    entries = SearchAndRenderDictionaryOptions()
+    if not entries:
+        st.info("Search jamdict and select an entry to add a card.")
+        return
 
-    if mode == "Paste text":
-        with st.form("AddCardsFromTextForm"):
-            sourceText = st.text_area("Japanese source text", height=220)
-            submitted = st.form_submit_button(
-                "Generate cards from text",
-                disabled=IsBusy(),
-            )
-        if submitted:
-            if not sourceText.strip():
-                st.error("Paste source text before generating cards.")
-            else:
-                HandleTextGeneration(connection, deck["id"], sourceText, schemaKey, extraTags)
+    optionById = {entry["entry_id"]: entry for entry in entries if entry.get("entry_id")}
+    optionIds = list(optionById.keys())
+    if not optionIds:
+        st.warning("Dictionary returned entries without IDs; try a different search.")
+        return
 
-    elif mode == "Upload text file":
-        uploadedFile = st.file_uploader("Upload .txt or .md", type=["txt", "md"])
-        with st.form("AddCardsFromFileForm"):
-            submitted = st.form_submit_button(
-                "Generate cards from uploaded text",
-                disabled=IsBusy() or uploadedFile is None,
-            )
-        if submitted and uploadedFile:
-            try:
-                sourceText = uploadedFile.getvalue().decode("utf-8")
-            except UnicodeDecodeError:
-                st.error("Could not decode file. Please upload UTF-8 text.")
-                return
-            if not sourceText.strip():
-                st.error("The uploaded file is empty.")
-                return
-            HandleTextGeneration(connection, deck["id"], sourceText, schemaKey, extraTags)
+    selectedEntryId = st.selectbox(
+        "Dictionary entries",
+        optionIds,
+        format_func=lambda entryId: FormatDictionaryEntryOption(optionById[entryId]),
+        key="AddCardsEntrySelect",
+    )
+    selectedEntry = optionById[selectedEntryId]
+
+    wordFormOptions = GetVerbFormOptions(selectedEntry)
+    requestedWordForm = st.selectbox(
+        "Word form",
+        wordFormOptions,
+        format_func=lambda key: VerbFormLabels[key],
+        key=f"AddCardsWordForm_{selectedEntryId}",
+    )
+    if not IsVerbEntry(selectedEntry):
+        st.caption("Selected entry is not a verb. Plain dictionary form will be used.")
     else:
-        with st.form("AddManualCardForm"):
-            kanji = st.text_input("Kanji")
-            kana = st.text_input("Hiragana / Katakana")
-            english = st.text_input("English")
-            notes = st.text_area("Notes")
-            submitted = st.form_submit_button("Add card", disabled=IsBusy())
-            if submitted:
-                isAdded = AddCard(
-                    connection,
-                    deck["id"],
-                    {
-                        "kanji": kanji,
-                        "kana": kana,
-                        "english": english,
-                        "notes": notes,
-                        "source_text": "manual",
-                        "schema_key": schemaKey,
-                        "media_type": "none",
-                        "media_files": [],
-                        "tags": extraTags,
-                    },
-                )
-                if isAdded:
-                    st.success("Card added.")
-                else:
-                    st.warning("Duplicate card skipped.")
+        st.caption(f"Verb type: {selectedEntry.get('verb_type_label', 'Verb')}")
+
+    englishOverride = st.text_input(
+        "English (optional override)",
+        value=selectedEntry.get("english", ""),
+        key=f"AddCardsEnglishOverride_{selectedEntryId}",
+    )
+    notes = st.text_area(
+        "Notes (optional)",
+        value="",
+        key=f"AddCardsNotes_{selectedEntryId}",
+    )
+
+    previewCard = BuildCardFromDictionaryEntry(
+        selectedEntry,
+        schemaKey,
+        requestedWordForm,
+        extraTags,
+        notes,
+        englishOverride=englishOverride,
+    )
+    st.markdown("### Card preview")
+    st.write(
+        {
+            "kanji": previewCard["kanji"],
+            "kana": previewCard["kana"],
+            "english": previewCard["english"],
+            "word_form": previewCard["word_form"],
+            "dictionary_entry_id": previewCard["dictionary_entry_id"],
+        }
+    )
+
+    if st.button("Add selected dictionary entry", disabled=IsBusy(), width="stretch", type="primary"):
+        isAdded = AddCard(connection, deck["id"], previewCard)
+        if isAdded:
+            st.success("Card added.")
+        else:
+            st.warning("Duplicate card skipped.")
 
 
 def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
@@ -297,7 +315,7 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             st.session_state[selectionStateKey] = {cardId: False for cardId in cardById}
             st.rerun()
 
-    searchText = st.text_input("Search cards", placeholder="Search kanji, kana, english, or notes")
+    searchText = st.text_input("Search cards", placeholder="Search kanji, kana, english, notes, dictionary id")
     rows = []
     for index, card in enumerate(cards, start=1):
         rows.append(
@@ -309,6 +327,8 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
                 "Kana": card["kana"],
                 "English": card["english"],
                 "Format": CardSchemas[card["schema_key"]]["Label"],
+                "WordForm": card["word_form"] or "dictionary",
+                "DictionaryId": card["dictionary_entry_id"] or "",
                 "Notes": card["notes"],
             }
         )
@@ -316,7 +336,7 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
 
     if searchText.strip():
         normalizedSearch = searchText.strip().lower()
-        searchColumns = ["Kanji", "Kana", "English", "Notes"]
+        searchColumns = ["Kanji", "Kana", "English", "Notes", "DictionaryId"]
         mask = browserFrame[searchColumns].fillna("").apply(
             lambda row: row.astype(str).str.lower().str.contains(normalizedSearch).any(),
             axis=1,
@@ -332,7 +352,7 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         hide_index=True,
         width="stretch",
         key=f"ReviewCardBrowser_{deck['id']}",
-        disabled=["CardId", "Index", "Kanji", "Kana", "English", "Format", "Notes"],
+        disabled=["CardId", "Index", "Kanji", "Kana", "English", "Format", "WordForm", "DictionaryId", "Notes"],
         column_config={
             "Select": st.column_config.CheckboxColumn("Select"),
             "CardId": None,
@@ -355,31 +375,13 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         key=f"BulkFormat_{deck['id']}",
     )
 
-    conversionForm = st.selectbox(
-        "Japanese word form for selected cards",
-        list(SupportedWordForms.keys()),
-        format_func=lambda key: SupportedWordForms[key],
-        key=f"BulkWordForm_{deck['id']}",
-    )
-    requireEnglishTranslation = st.checkbox(
-        "Require English translation",
-        key=f"BulkRequireEnglish_{deck['id']}",
-        help="If checked, missing English is generated for selected cards during Apply.",
-    )
-
-    applyColumn, verifyColumn, confirmDeleteColumn, deleteColumn = st.columns([1.1, 1.1, 1.0, 1.0])
+    applyColumn, confirmDeleteColumn, deleteColumn = st.columns([1.1, 1.0, 1.0])
     with applyColumn:
-        applySubmitted = st.button(
-            "Apply selected changes",
+        applyFormatSubmitted = st.button(
+            "Apply selected format",
             disabled=IsBusy() or not selectedCardIds,
             width="stretch",
             type="primary",
-        )
-    with verifyColumn:
-        verifySubmitted = st.button(
-            "Verify selected cards",
-            disabled=IsBusy() or not selectedCardIds,
-            width="stretch",
         )
     with confirmDeleteColumn:
         confirmDelete = st.checkbox(
@@ -393,170 +395,14 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             width="stretch",
         )
 
-    if applySubmitted:
-        if not BeginBusyAction("Applying bulk changes"):
-            st.warning("A request is already in progress.")
-            return
-
-        progressBar = st.progress(0, text="Applying bulk changes...")
-        try:
-            selectedCardsForApply = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
-            cardUpdatesById: Dict[str, Dict[str, str]] = {
-                card["id"]: {
-                    "kanji": card["kanji"],
-                    "kana": card["kana"],
-                    "english": card["english"],
-                    "notes": card["notes"],
-                    "schema_key": formatSelection,
-                }
-                for card in selectedCardsForApply
-            }
-
-            client = GetOpenAiClient()
-            conversions, conversionErrors = ConvertJapaneseWords(
-                client,
-                DefaultModel,
-                selectedCardsForApply,
-                conversionForm,
-                BuildProgressUpdater(progressBar),
-            )
-            convertedCount = 0
-            for item in conversions:
-                cardId = item["id"]
-                if cardId not in cardUpdatesById:
-                    continue
-                currentKanji = cardUpdatesById[cardId]["kanji"]
-                currentKana = cardUpdatesById[cardId]["kana"]
-                nextKanji = item.get("kanji", currentKanji)
-                nextKana = item.get("kana", currentKana)
-                if nextKanji != currentKanji or nextKana != currentKana:
-                    convertedCount += 1
-                cardUpdatesById[cardId]["kanji"] = nextKanji
-                cardUpdatesById[cardId]["kana"] = nextKana
-
-            translatedCount = 0
-            translationErrors: List[str] = []
-            cardsMissingEnglish = []
-            for card in selectedCardsForApply:
-                updated = cardUpdatesById[card["id"]]
-                if not (updated["english"] or "").strip():
-                    cardsMissingEnglish.append(
-                        {
-                            "id": card["id"],
-                            "kanji": updated["kanji"],
-                            "kana": updated["kana"],
-                            "source_text": card["source_text"],
-                            "notes": card["notes"],
-                        }
-                    )
-
-            if requireEnglishTranslation and cardsMissingEnglish:
-                translations, translationErrors = GenerateEnglishTranslations(
-                    client,
-                    DefaultModel,
-                    cardsMissingEnglish,
-                    BuildProgressUpdater(progressBar),
-                )
-                for item in translations:
-                    cardId = item["id"]
-                    if cardId not in cardUpdatesById:
-                        continue
-                    currentEnglish = cardUpdatesById[cardId]["english"]
-                    nextEnglish = item["english"]
-                    if currentEnglish != nextEnglish:
-                        translatedCount += 1
-                    cardUpdatesById[cardId]["english"] = nextEnglish
-
-            appliedCount = 0
-            duplicateSkippedCount = 0
-            for card in selectedCardsForApply:
-                updated = cardUpdatesById[card["id"]]
-                isApplied = UpdateCardContent(
-                    connection,
-                    deck["id"],
-                    card["id"],
-                    updated["kanji"],
-                    updated["kana"],
-                    updated["english"],
-                    updated["notes"],
-                    updated["schema_key"],
-                )
-                if isApplied:
-                    appliedCount += 1
-                else:
-                    duplicateSkippedCount += 1
-
-            progressBar.progress(100, text="Bulk changes applied.")
-            statusParts = [
-                f"Applied changes to {appliedCount} card(s)",
-                f"converted {convertedCount} card(s) to {SupportedWordForms[conversionForm]}",
-            ]
-            if requireEnglishTranslation:
-                statusParts.append(f"generated English for {translatedCount} card(s)")
-            if duplicateSkippedCount:
-                statusParts.append(f"skipped {duplicateSkippedCount} duplicate word(s) in the selected format")
-            st.success("; ".join(statusParts) + ".")
-            if requireEnglishTranslation and not cardsMissingEnglish:
-                st.info("All selected cards already include English translations.")
-            RenderErrorList(conversionErrors, "Some conversions failed")
-            RenderErrorList(translationErrors, "Translation errors")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-        finally:
-            EndBusyAction()
-
-    if verifySubmitted:
-        if not BeginBusyAction("Verifying selected cards"):
-            st.warning("A request is already in progress.")
-            return
-
-        progressBar = st.progress(0, text="Verifying selected cards...")
-        try:
-            selectedCardsForVerify = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
-            client = GetOpenAiClient()
-            verifiedCards, verificationErrors = VerifyCardsAgainstSelection(
-                client,
-                DefaultModel,
-                selectedCardsForVerify,
-                conversionForm,
-                formatSelection,
-                BuildProgressUpdater(progressBar),
-            )
-            verifiedById = {item["id"]: item for item in verifiedCards}
-
-            verifiedCount = 0
-            duplicateSkippedCount = 0
-            for card in selectedCardsForVerify:
-                verified = verifiedById.get(card["id"])
-                if not verified:
-                    continue
-                isApplied = UpdateCardContent(
-                    connection,
-                    deck["id"],
-                    card["id"],
-                    verified["kanji"],
-                    verified["kana"],
-                    verified["english"],
-                    verified["notes"],
-                    formatSelection,
-                )
-                if isApplied:
-                    verifiedCount += 1
-                else:
-                    duplicateSkippedCount += 1
-
-            progressBar.progress(100, text="Verification complete.")
-            statusParts = [f"Verified and updated {verifiedCount} card(s)"]
-            if duplicateSkippedCount:
-                statusParts.append(f"skipped {duplicateSkippedCount} duplicate word(s) in the selected format")
-            st.success("; ".join(statusParts) + ".")
-            RenderErrorList(verificationErrors, "Verification issues")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
-        finally:
-            EndBusyAction()
+    if applyFormatSubmitted:
+        updatedCount = UpdateCardsSchemaByIds(connection, deck["id"], selectedCardIds, formatSelection)
+        skippedCount = len(selectedCardIds) - updatedCount
+        statusParts = [f"Updated format for {updatedCount} card(s)"]
+        if skippedCount:
+            statusParts.append(f"skipped {skippedCount} duplicate word(s)")
+        st.success("; ".join(statusParts) + ".")
+        st.rerun()
 
     if deleteSubmitted:
         deletedCount = DeleteCardsByIds(connection, deck["id"], selectedCardIds)
@@ -577,6 +423,12 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             "english": card["english"],
             "notes": card["notes"],
             "schema": CardSchemas[card["schema_key"]]["Label"],
+            "word_form": card["word_form"],
+            "dictionary_entry_id": card["dictionary_entry_id"],
+            "dictionary_headword": card["dictionary_headword"],
+            "dictionary_reading": card["dictionary_reading"],
+            "dictionary_gloss": card["dictionary_gloss"],
+            "dictionary_pos": card["dictionary_pos"],
             "media_type": card["media_type"],
             "media_files": json.loads(card["media_files_json"]),
         }
@@ -611,52 +463,6 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             else:
                 st.warning("Update skipped: duplicate word already exists in this format.")
 
-    with st.form("GenerateMissingEnglishForm"):
-        st.caption("Generate English translation if this card is missing English text.")
-        submittedGenerateEnglish = st.form_submit_button(
-            "Generate missing English translation",
-            disabled=IsBusy() or bool(card["english"].strip()),
-        )
-        if submittedGenerateEnglish:
-            if not BeginBusyAction("Generating missing English translations"):
-                st.warning("A request is already in progress.")
-                return
-            progressBar = st.progress(0, text="Preparing translation...")
-            try:
-                client = GetOpenAiClient()
-                translations, translationErrors = GenerateEnglishTranslations(
-                    client,
-                    DefaultModel,
-                    [card],
-                    BuildProgressUpdater(progressBar),
-                )
-                generatedCount = 0
-                for item in translations:
-                    if item["id"] != card["id"]:
-                        continue
-                    isUpdated = UpdateCardContent(
-                        connection,
-                        deck["id"],
-                        card["id"],
-                        card["kanji"],
-                        card["kana"],
-                        item["english"],
-                        card["notes"],
-                        card["schema_key"],
-                    )
-                    generatedCount += int(isUpdated)
-                progressBar.progress(100, text="English translation generation complete.")
-                if generatedCount > 0:
-                    st.success("Generated English translation for this card.")
-                    st.rerun()
-                else:
-                    st.warning("No translation was generated (or update was skipped as duplicate).")
-                RenderErrorList(translationErrors, "Translation errors")
-            except Exception as exc:
-                st.error(str(exc))
-            finally:
-                EndBusyAction()
-
     st.markdown("### Replace text with media")
     with st.form("ReplaceWithMediaForm"):
         replaceTarget = st.selectbox("Replace which concept", ["english", "kana", "kanji", "none"])
@@ -682,6 +488,157 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
                     st.error("Media replacement skipped: duplicate word already exists in this format.")
 
 
+def NormalizeScanText(value: str) -> str:
+    normalizedValue = re.sub(r"\s+", "", (value or "").strip())
+    return NormalizeNumericJapaneseSurface(normalizedValue)
+
+
+def ExtractScanTermsFromExpression(expression: str) -> List[str]:
+    normalizedExpression = NormalizeScanText(expression)
+    if not normalizedExpression:
+        return []
+
+    containsConnector = any(connector in normalizedExpression for connector in ScanExpressionConnectors)
+    if containsConnector:
+        rawParts = re.split(r"[のノ/／]+", normalizedExpression)
+        segments: List[str] = []
+        for rawPart in rawParts:
+            segments.extend(JapaneseSegmentPattern.findall(rawPart))
+    else:
+        segments = JapaneseSegmentPattern.findall(normalizedExpression)
+
+    if not segments:
+        return [normalizedExpression]
+
+    if not containsConnector:
+        terms: List[str] = []
+        for segment in segments:
+            if segment and segment not in terms:
+                terms.append(segment)
+        return terms
+
+    # Connector expressions with numeric compounds should expand to atomic terms.
+    # Example: 四分の三 -> 四, 分, 三
+    terms: List[str] = []
+    for segment in segments:
+        if not segment:
+            continue
+
+        isKanjiCompound = len(segment) > 1 and KanjiOnlyPattern.match(segment) is not None
+        isNumericCompound = isKanjiCompound and NumeralKanjiPattern.search(segment) is not None
+        if isNumericCompound:
+            for character in segment:
+                if character not in terms:
+                    terms.append(character)
+        else:
+            if segment not in terms:
+                terms.append(segment)
+
+    return terms
+
+
+def ExpandExtractedScanCandidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    expandedCandidates: List[Dict[str, Any]] = []
+    seenKeys = set()
+    dictionaryMatchCache: Dict[str, bool] = {}
+
+    for candidate in candidates:
+        originalVisibleText = NormalizeScanText(candidate.get("visible_text", ""))
+        originalKanjiText = NormalizeScanText(candidate.get("kanji", ""))
+        originalKanaText = NormalizeScanText(candidate.get("kana", ""))
+
+        seedExpressions: List[str] = []
+        for seed in [originalKanjiText, originalVisibleText]:
+            if seed and seed not in seedExpressions:
+                seedExpressions.append(seed)
+
+        derivedTerms: List[str] = []
+        for expression in seedExpressions:
+            for term in ExtractScanTermsFromExpression(expression):
+                if term and term not in derivedTerms:
+                    derivedTerms.append(term)
+
+        refinedTerms: List[str] = []
+        for term in derivedTerms:
+            normalizedTerm = NormalizeScanText(term)
+            if not normalizedTerm:
+                continue
+
+            forceSplitNumericFunCompound = NumericFunCompoundPattern.match(normalizedTerm) is not None
+            if forceSplitNumericFunCompound:
+                for character in normalizedTerm:
+                    if character not in refinedTerms:
+                        refinedTerms.append(character)
+                continue
+
+            shouldSplitUnmatchedCompound = (
+                len(normalizedTerm) > 1
+                and KanjiOnlyPattern.match(normalizedTerm) is not None
+            )
+            if shouldSplitUnmatchedCompound:
+                if normalizedTerm not in dictionaryMatchCache:
+                    try:
+                        dictionaryMatchCache[normalizedTerm] = bool(
+                            SearchDictionaryEntries(normalizedTerm, limit=1)
+                        )
+                    except Exception:
+                        # If dictionary search fails, keep original compound to avoid data loss.
+                        dictionaryMatchCache[normalizedTerm] = True
+
+                if not dictionaryMatchCache[normalizedTerm]:
+                    for character in normalizedTerm:
+                        if character not in refinedTerms:
+                            refinedTerms.append(character)
+                    continue
+
+            if normalizedTerm not in refinedTerms:
+                refinedTerms.append(normalizedTerm)
+
+        if not refinedTerms:
+            fallbackTerm = originalKanjiText or originalVisibleText
+            if fallbackTerm:
+                refinedTerms = [fallbackTerm]
+
+        originText = originalVisibleText or originalKanjiText
+        for term in refinedTerms:
+            normalizedOrigin = NormalizeScanText(originText)
+            normalizedTerm = NormalizeScanText(term)
+            isKanaOnlyTerm = KanaOnlyPattern.match(normalizedTerm or "") is not None
+            isKanaOnlyOrigin = KanaOnlyPattern.match(normalizedOrigin or "") is not None
+            if isKanaOnlyTerm and isKanaOnlyOrigin:
+                # Kana-only OCR terms are highly ambiguous and generate noisy homophone matches.
+                continue
+
+            candidateKey = (term, "")
+            if candidateKey in seenKeys:
+                continue
+            seenKeys.add(candidateKey)
+
+            keepOriginalKana = len(refinedTerms) == 1 and term in {originalKanjiText, originalVisibleText}
+            expandedCandidates.append(
+                {
+                    **candidate,
+                    "origin_visible_text": originText or term,
+                    "visible_text": term,
+                    "kanji": term,
+                    "kana": originalKanaText if keepOriginalKana else "",
+                }
+            )
+
+    return expandedCandidates
+
+
+def BuildScanCandidateNote(candidate: Dict[str, Any]) -> str:
+    imageName = (candidate.get("image_name") or "").strip()
+    originText = NormalizeScanText(candidate.get("origin_visible_text", ""))
+    termText = NormalizeScanText(candidate.get("visible_text", "")) or NormalizeScanText(candidate.get("kanji", ""))
+
+    note = f"Extracted from image: {imageName}" if imageName else "Extracted from image"
+    if originText and originText != termText:
+        note += f" | Derived from: {originText}"
+    return note
+
+
 def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
     deck = ChooseDeck(connection, "ScanImages")
     if deck is None:
@@ -696,9 +653,9 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
     tagsText = st.text_input("Extra tags", value="japanese,image-scan", key="ScanImagesTags")
     extraTags = [tag.strip() for tag in tagsText.split(",") if tag.strip()]
     wordForm = st.selectbox(
-        "Word form for extracted Japanese words",
-        list(SupportedWordForms.keys()),
-        format_func=lambda key: SupportedWordForms[key],
+        "Verb form for matched dictionary verbs",
+        list(VerbFormLabels.keys()),
+        format_func=lambda key: VerbFormLabels[key],
         key="ScanImagesWordForm",
     )
 
@@ -731,44 +688,89 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
         progressBar = st.progress(0, text="Preparing image scan...")
         try:
             client = GetOpenAiClient()
-            extractedCards, errors = ExtractCardsFromImages(
+            extractedCandidates, errors = ExtractCardsFromImages(
                 client,
                 DefaultModel,
                 uploads,
-                schemaKey,
-                extraTags,
-                wordForm,
                 BuildProgressUpdater(progressBar),
             )
-            cardsMissingEnglish = [card for card in extractedCards if not (card.get("english") or "").strip()]
-            if cardsMissingEnglish:
-                progressBar.progress(65, text="Generating missing English translations...")
-                translationCards = [
+            expandedCandidates = ExpandExtractedScanCandidates(extractedCandidates)
+
+            resolvedCards: List[Dict[str, Any]] = []
+            previewRows: List[Dict[str, Any]] = []
+            dictionaryMatchedCount = 0
+            dictionaryMissCount = 0
+            politeSurfaceSkippedCount = 0
+            duplicateEntrySkippedCount = 0
+            seenSurfaceAndForm = set()
+
+            for index, candidate in enumerate(expandedCandidates, start=1):
+                progressBar.progress(
+                    min(95, 30 + int((index / max(len(expandedCandidates), 1)) * 60)),
+                    text=f"Matching dictionary entries ({index}/{len(expandedCandidates)})...",
+                )
+                resolvedEntry = ResolveBestDictionaryEntry(
+                    sourceKanji=candidate.get("kanji", ""),
+                    sourceKana=candidate.get("kana", ""),
+                    visibleText=candidate.get("visible_text", ""),
+                )
+                noteText = BuildScanCandidateNote(candidate)
+                sourceText = candidate.get("origin_visible_text") or candidate.get("visible_text", "")
+                if resolvedEntry:
+                    card = BuildCardFromDictionaryEntry(
+                        resolvedEntry,
+                        schemaKey,
+                        wordForm,
+                        extraTags + ["image_ocr"],
+                        notes=noteText,
+                        sourceText=sourceText,
+                    )
+                else:
+                    dictionaryMissCount += 1
+                    continue
+
+                if wordForm == "dictionary" and (
+                    LooksLikePoliteMasuSurface(card.get("kanji", ""))
+                    or LooksLikePoliteMasuSurface(card.get("kana", ""))
+                ):
+                    politeSurfaceSkippedCount += 1
+                    continue
+
+                cardWordForm = (card.get("word_form") or "dictionary").strip() or "dictionary"
+                surfaceKey = (card.get("kanji") or card.get("dictionary_headword") or card.get("kana") or "").strip()
+                dedupeKey = (surfaceKey, cardWordForm)
+                if surfaceKey and dedupeKey in seenSurfaceAndForm:
+                    duplicateEntrySkippedCount += 1
+                    continue
+                if surfaceKey:
+                    seenSurfaceAndForm.add(dedupeKey)
+
+                dictionaryMatchedCount += 1
+                resolvedCards.append(card)
+                previewRows.append(
                     {
-                        "id": str(index),
+                        "visible_text": candidate.get("visible_text", ""),
+                        "source_text": candidate.get("origin_visible_text", ""),
+                        "matched_dictionary": bool(resolvedEntry),
+                        "dictionary_entry_id": card.get("dictionary_entry_id", ""),
                         "kanji": card.get("kanji", ""),
                         "kana": card.get("kana", ""),
-                        "source_text": card.get("source_text", ""),
-                        "notes": card.get("notes", ""),
+                        "english": card.get("english", ""),
                     }
-                    for index, card in enumerate(cardsMissingEnglish)
-                ]
-                translations, translationErrors = GenerateEnglishTranslations(
-                    client,
-                    DefaultModel,
-                    translationCards,
-                    BuildProgressUpdater(progressBar),
                 )
-                translationById = {item["id"]: item["english"] for item in translations}
-                for index, card in enumerate(cardsMissingEnglish):
-                    english = translationById.get(str(index), "")
-                    if english:
-                        card["english"] = english
-                errors.extend([f"Translation: {error}" for error in translationErrors])
 
             added = 0
             duplicates = 0
-            for card in extractedCards:
+            for card in resolvedCards:
+                if DeckHasKanjiWordForm(
+                    connection,
+                    deck["id"],
+                    card.get("schema_key", ""),
+                    card.get("word_form", "dictionary"),
+                    card.get("kanji", ""),
+                ):
+                    duplicates += 1
+                    continue
                 if DeckHasCandidate(connection, deck["id"], card):
                     duplicates += 1
                     continue
@@ -779,11 +781,15 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
             st.success(
                 f"Scanned {len(uploads)} images. Added {added} new cards and skipped {duplicates} duplicates."
             )
-            if extractedCards:
-                st.dataframe(pd.DataFrame(extractedCards), width="stretch", hide_index=True)
-            missingEnglishCount = sum(1 for card in extractedCards if not (card.get("english") or "").strip())
-            if missingEnglishCount > 0:
-                st.warning(f"{missingEnglishCount} extracted card(s) are still missing English translations.")
+            st.info(
+                f"OCR produced {len(extractedCandidates)} raw candidate(s), expanded to {len(expandedCandidates)} term candidate(s). "
+                f"Dictionary matched {dictionaryMatchedCount} candidate(s); "
+                f"skipped {dictionaryMissCount} unmatched candidate(s); "
+                f"skipped {politeSurfaceSkippedCount} candidate(s) that still looked like polite/masu while dictionary form was selected; "
+                f"skipped {duplicateEntrySkippedCount} duplicate dictionary-entry candidate(s)."
+            )
+            if previewRows:
+                st.dataframe(pd.DataFrame(previewRows), width="stretch", hide_index=True)
             RenderErrorList(errors, "Some images failed to parse")
         except Exception as exc:
             st.error(str(exc))
@@ -796,7 +802,11 @@ def RenderImportCsvPage(connection: sqlite3.Connection) -> None:
     if deck is None:
         return
 
-    st.caption("CSV columns: kanji, kana, english, notes, source_text, schema_key, media_type, tags")
+    st.caption(
+        "CSV columns: kanji, kana, english, notes, source_text, schema_key, media_type, tags, "
+        "dictionary_entry_id, dictionary_headword, dictionary_reading, dictionary_gloss, "
+        "dictionary_pos, verb_type, word_form"
+    )
     uploaded = st.file_uploader("Upload CSV", type=["csv"], key="ImportCsvUploader")
 
     if st.button(
