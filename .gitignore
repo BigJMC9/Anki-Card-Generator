@@ -5,3 +5,4 @@ anki_workspace/openai_api_debug.log
 **/__pycache__/**
 **.apkg
 **.env
+**.log
