@@ -27,7 +27,14 @@ from AnkiDeckBuilder.DatabaseService import (
     UpdateCardMedia,
 )
 from AnkiDeckBuilder.ExportService import ExportDeckPackage
-from AnkiDeckBuilder.OpenAiService import ExtractCardsFromImages, GenerateCardsFromText, GetOpenAiClient
+from AnkiDeckBuilder.OpenAiService import (
+    ConvertJapaneseWords,
+    ExtractCardsFromImages,
+    GenerateCardsFromText,
+    GenerateEnglishTranslations,
+    GetOpenAiClient,
+    SupportedWordForms,
+)
 from AnkiDeckBuilder.UiState import BeginBusyAction, EndBusyAction, IsBusy
 from AnkiDeckBuilder.WorkspaceService import CopyUploadedMedia
 
@@ -347,7 +354,7 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         key=f"BulkFormat_{deck['id']}",
     )
 
-    applyColumn, deleteColumn = st.columns(2)
+    applyColumn, convertColumn, translateColumn, deleteColumn = st.columns(4)
     with applyColumn:
         if st.button(
             "Apply format to selected cards",
@@ -357,6 +364,85 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             updatedCount = UpdateCardsSchemaByIds(connection, deck["id"], selectedCardIds, formatSelection)
             st.success(f"Updated {updatedCount} card format(s).")
             st.rerun()
+
+    conversionForm = st.selectbox(
+        "Japanese word form for selected cards",
+        list(SupportedWordForms.keys()),
+        format_func=lambda key: SupportedWordForms[key],
+        key=f"BulkWordForm_{deck['id']}",
+    )
+    with convertColumn:
+        if st.button(
+            "Convert selected cards",
+            disabled=IsBusy() or not selectedCardIds,
+            use_container_width=True,
+        ):
+            if not BeginBusyAction("Converting selected cards"):
+                st.warning("A request is already in progress.")
+                return
+            progressBar = st.progress(0, text="Preparing conversion...")
+            try:
+                client = GetOpenAiClient()
+                selectedCardsForConversion = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
+                conversions, conversionErrors = ConvertJapaneseWords(
+                    client,
+                    DefaultModel,
+                    selectedCardsForConversion,
+                    conversionForm,
+                    BuildProgressUpdater(progressBar),
+                )
+                convertedCount = 0
+                for item in conversions:
+                    cardId = item["id"]
+                    if cardId not in cardById:
+                        continue
+                    UpdateCardField(connection, cardId, "kanji", item.get("kanji", ""))
+                    UpdateCardField(connection, cardId, "kana", item.get("kana", ""))
+                    convertedCount += 1
+                progressBar.progress(100, text="Selected cards converted.")
+                st.success(f"Converted {convertedCount} selected card(s) to {SupportedWordForms[conversionForm]}.")
+                RenderErrorList(conversionErrors, "Some conversions failed")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+            finally:
+                EndBusyAction()
+
+    with translateColumn:
+        if st.button(
+            "Generate missing English for selected",
+            disabled=IsBusy() or not selectedCardIds,
+            use_container_width=True,
+        ):
+            if not BeginBusyAction("Generating missing English translations"):
+                st.warning("A request is already in progress.")
+                return
+            progressBar = st.progress(0, text="Preparing translation...")
+            try:
+                client = GetOpenAiClient()
+                selectedCards = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
+                cardsMissingEnglish = [card for card in selectedCards if not (card["english"] or "").strip()]
+                if not cardsMissingEnglish:
+                    st.info("All selected cards already include English translations.")
+                else:
+                    translations, translationErrors = GenerateEnglishTranslations(
+                        client,
+                        DefaultModel,
+                        cardsMissingEnglish,
+                        BuildProgressUpdater(progressBar),
+                    )
+                    updatedCount = 0
+                    for item in translations:
+                        UpdateCardField(connection, item["id"], "english", item["english"])
+                        updatedCount += 1
+                    progressBar.progress(100, text="English translation generation complete.")
+                    st.success(f"Generated English translations for {updatedCount} selected card(s).")
+                    RenderErrorList(translationErrors, "Translation errors")
+                    st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+            finally:
+                EndBusyAction()
 
     with deleteColumn:
         confirmDelete = st.checkbox(
@@ -413,6 +499,43 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             st.success("Card updated.")
             st.rerun()
 
+    with st.form("GenerateMissingEnglishForm"):
+        st.caption("Generate English translation if this card is missing English text.")
+        submittedGenerateEnglish = st.form_submit_button(
+            "Generate missing English translation",
+            disabled=IsBusy() or bool(card["english"].strip()),
+        )
+        if submittedGenerateEnglish:
+            if not BeginBusyAction("Generating missing English translations"):
+                st.warning("A request is already in progress.")
+                return
+            progressBar = st.progress(0, text="Preparing translation...")
+            try:
+                client = GetOpenAiClient()
+                translations, translationErrors = GenerateEnglishTranslations(
+                    client,
+                    DefaultModel,
+                    [card],
+                    BuildProgressUpdater(progressBar),
+                )
+                generatedCount = 0
+                for item in translations:
+                    if item["id"] != card["id"]:
+                        continue
+                    UpdateCardField(connection, card["id"], "english", item["english"])
+                    generatedCount += 1
+                progressBar.progress(100, text="English translation generation complete.")
+                if generatedCount > 0:
+                    st.success("Generated English translation for this card.")
+                    st.rerun()
+                else:
+                    st.warning("No translation was generated.")
+                RenderErrorList(translationErrors, "Translation errors")
+            except Exception as exc:
+                st.error(str(exc))
+            finally:
+                EndBusyAction()
+
     st.markdown("### Replace text with media")
     with st.form("ReplaceWithMediaForm"):
         replaceTarget = st.selectbox("Replace which concept", ["english", "kana", "kanji", "none"])
@@ -448,6 +571,12 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
     )
     tagsText = st.text_input("Extra tags", value="japanese,image-scan", key="ScanImagesTags")
     extraTags = [tag.strip() for tag in tagsText.split(",") if tag.strip()]
+    wordForm = st.selectbox(
+        "Word form for extracted Japanese words",
+        list(SupportedWordForms.keys()),
+        format_func=lambda key: SupportedWordForms[key],
+        key="ScanImagesWordForm",
+    )
 
     uploads = st.file_uploader(
         "Upload one or more images",
@@ -484,8 +613,34 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
                 uploads,
                 schemaKey,
                 extraTags,
+                wordForm,
                 BuildProgressUpdater(progressBar),
             )
+            cardsMissingEnglish = [card for card in extractedCards if not (card.get("english") or "").strip()]
+            if cardsMissingEnglish:
+                progressBar.progress(65, text="Generating missing English translations...")
+                translationCards = [
+                    {
+                        "id": str(index),
+                        "kanji": card.get("kanji", ""),
+                        "kana": card.get("kana", ""),
+                        "source_text": card.get("source_text", ""),
+                        "notes": card.get("notes", ""),
+                    }
+                    for index, card in enumerate(cardsMissingEnglish)
+                ]
+                translations, translationErrors = GenerateEnglishTranslations(
+                    client,
+                    DefaultModel,
+                    translationCards,
+                    BuildProgressUpdater(progressBar),
+                )
+                translationById = {item["id"]: item["english"] for item in translations}
+                for index, card in enumerate(cardsMissingEnglish):
+                    english = translationById.get(str(index), "")
+                    if english:
+                        card["english"] = english
+                errors.extend([f"Translation: {error}" for error in translationErrors])
 
             added = 0
             duplicates = 0
@@ -502,6 +657,9 @@ def RenderScanImagesPage(connection: sqlite3.Connection) -> None:
             )
             if extractedCards:
                 st.dataframe(pd.DataFrame(extractedCards), use_container_width=True, hide_index=True)
+            missingEnglishCount = sum(1 for card in extractedCards if not (card.get("english") or "").strip())
+            if missingEnglishCount > 0:
+                st.warning(f"{missingEnglishCount} extracted card(s) are still missing English translations.")
             RenderErrorList(errors, "Some images failed to parse")
         except Exception as exc:
             st.error(str(exc))
