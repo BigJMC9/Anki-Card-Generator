@@ -13,41 +13,13 @@ class PageDefinition:
 PageDefinitions: List[PageDefinition] = [
     PageDefinition("Dashboard", "Dashboard", "Deck and card totals across your workspace.", "Overview"),
     PageDefinition(
-        "CreateCollections",
-        "Create / Rename Collections",
-        "Set up collection groups before building decks.",
-        "Build",
+        "Dictionary",
+        "Dictionary",
+        "Search jamdict entries and review their details.",
+        "Overview",
     ),
-    PageDefinition(
-        "CreateDecks",
-        "Create / Rename Decks",
-        "Create decks inside collections and keep names organized.",
-        "Build",
-    ),
-    PageDefinition(
-        "AddCards",
-        "Search Dictionary / Add Cards",
-        "Search jamdict and add selected entries to global pool or decks.",
-        "Build",
-    ),
-    PageDefinition(
-        "GlobalCards",
-        "Global Card Pool",
-        "Manage reusable global cards and import between global pool and decks.",
-        "Build",
-    ),
-    PageDefinition(
-        "ReviewCards",
-        "Review Cards / Replace With Media",
-        "Edit card text, adjust card formats, and attach media replacements.",
-        "Maintain",
-    ),
-    PageDefinition(
-        "ScanImages",
-        "Scan Images For Missing Cards",
-        "Extract visible text from images and add missing cards.",
-        "Build",
-    ),
+    PageDefinition("Cards", "Cards", "Manage global/deck cards, deck structure, and OCR scans.", "Workspace"),
+    PageDefinition("AddCards", "Add Cards", "Add dictionary cards or custom cards to global pool/decks.", "Workspace"),
     PageDefinition(
         "ImportCsv",
         "Import CSV",
@@ -64,7 +36,7 @@ PageDefinitions: List[PageDefinition] = [
 
 PageOrder = [page.Key for page in PageDefinitions]
 PageByKey: Dict[str, PageDefinition] = {page.Key: page for page in PageDefinitions}
-SectionOrder = ["Overview", "Build", "Maintain"]
+SectionOrder = ["Overview", "Workspace", "Maintain"]
 
 
 def GetDefaultPageKey() -> str:

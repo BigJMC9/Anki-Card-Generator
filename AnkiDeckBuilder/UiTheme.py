@@ -1,10 +1,10 @@
 ThemeStyles = {
-    "AppBackground": "linear-gradient(160deg, #f7f8f5 0%, #eef2e4 100%)",
-    "SidebarBackground": "#f3f5ed",
-    "SidebarBorder": "1px solid #d6ddc2",
-    "CardBackground": "rgba(255, 255, 255, 0.92)",
-    "CardBorder": "1px solid #dbe3ca",
-    "MutedText": "#4f5943",
-    "Accent": "#3e6b2f",
-    "Danger": "#b42318",
+    "AppBackground": "linear-gradient(160deg, #0c1118 0%, #111826 100%)",
+    "SidebarBackground": "#0d1420",
+    "SidebarBorder": "1px solid #1e2a3a",
+    "CardBackground": "rgba(20, 28, 40, 0.92)",
+    "CardBorder": "1px solid #253447",
+    "MutedText": "#9ab0c9",
+    "Accent": "#63a3ff",
+    "Danger": "#f97066",
 }
