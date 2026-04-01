@@ -39,21 +39,10 @@ def main() -> None:
 
     currentPageKey = GetCurrentPageKey(defaultPageKey)
 
-    st.title(AppTitle)
-    st.caption(
-        "Build Japanese decks with jamdict-backed cards, global card pool reuse, image scanning, review, and Anki export."
-    )
-
     if IsBusy():
         st.warning(f"Processing: {GetBusyActionName()}")
 
-    selectedPageFromTopNav = RenderTopNavigation(currentPageKey, IsBusy())
-    if selectedPageFromTopNav:
-        SetCurrentPageKey(selectedPageFromTopNav)
-        st.rerun()
-
     pageDefinition = GetPageDefinition(currentPageKey)
-    st.markdown("---")
     st.markdown(f"## {pageDefinition.Label}")
     st.caption(pageDefinition.Description)
 
