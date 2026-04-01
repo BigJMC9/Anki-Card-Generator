@@ -72,9 +72,31 @@ def NormalizeText(value: str) -> str:
     return normalizedValue
 
 
-def BuildCardUniqueKey(kanji: str, kana: str, english: str) -> str:
-    raw = "|".join([NormalizeText(kanji), NormalizeText(kana), NormalizeText(english)])
+def BuildCardUniqueKey(schemaKey: str, kanji: str, kana: str) -> str:
+    raw = "|".join([NormalizeText(schemaKey), NormalizeText(kanji), NormalizeText(kana)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def CardWordExistsInSchema(
+    connection: sqlite3.Connection,
+    deckId: str,
+    schemaKey: str,
+    kanji: str,
+    kana: str,
+    excludeCardId: Optional[str] = None,
+) -> bool:
+    targetKey = BuildCardUniqueKey(schemaKey, kanji, kana)
+    rows = connection.execute(
+        "SELECT id, schema_key, kanji, kana FROM cards WHERE deck_id = ? AND schema_key = ?",
+        (deckId, schemaKey),
+    ).fetchall()
+    for row in rows:
+        if excludeCardId and row["id"] == excludeCardId:
+            continue
+        rowKey = BuildCardUniqueKey(row["schema_key"], row["kanji"], row["kana"])
+        if rowKey == targetKey:
+            return True
+    return False
 
 
 def ListCollections(connection: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -173,7 +195,15 @@ def GetDeckCardCounts(connection: sqlite3.Connection) -> Dict[str, int]:
 
 
 def AddCard(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -> bool:
-    uniqueKey = BuildCardUniqueKey(card.get("kanji", ""), card.get("kana", ""), card.get("english", ""))
+    schemaKey = card.get("schema_key") or "kana_kanji_front_english_back"
+    kanji = (card.get("kanji") or "").strip()
+    kana = (card.get("kana") or "").strip()
+    english = (card.get("english") or "").strip()
+
+    if CardWordExistsInSchema(connection, deckId, schemaKey, kanji, kana):
+        return False
+
+    uniqueKey = BuildCardUniqueKey(schemaKey, kanji, kana)
     try:
         connection.execute(
             """
@@ -185,12 +215,12 @@ def AddCard(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -
             (
                 str(uuid.uuid4()),
                 deckId,
-                (card.get("kanji") or "").strip(),
-                (card.get("kana") or "").strip(),
-                (card.get("english") or "").strip(),
+                kanji,
+                kana,
+                english,
                 (card.get("notes") or "").strip(),
                 (card.get("source_text") or "").strip(),
-                card.get("schema_key") or "kana_kanji_front_english_back",
+                schemaKey,
                 card.get("media_type") or "none",
                 json.dumps(card.get("media_files") or [], ensure_ascii=False),
                 json.dumps(card.get("tags") or [], ensure_ascii=False),
@@ -204,10 +234,99 @@ def AddCard(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -
         return False
 
 
+def UpdateCardContent(
+    connection: sqlite3.Connection,
+    deckId: str,
+    cardId: str,
+    kanji: str,
+    kana: str,
+    english: str,
+    notes: str,
+    schemaKey: str,
+) -> bool:
+    normalizedKanji = (kanji or "").strip()
+    normalizedKana = (kana or "").strip()
+    normalizedEnglish = (english or "").strip()
+    normalizedNotes = (notes or "").strip()
+    normalizedSchemaKey = (schemaKey or "").strip() or "kana_kanji_front_english_back"
+
+    if CardWordExistsInSchema(
+        connection,
+        deckId,
+        normalizedSchemaKey,
+        normalizedKanji,
+        normalizedKana,
+        excludeCardId=cardId,
+    ):
+        return False
+
+    uniqueKey = BuildCardUniqueKey(normalizedSchemaKey, normalizedKanji, normalizedKana)
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE cards
+            SET kanji = ?, kana = ?, english = ?, notes = ?, schema_key = ?, unique_key = ?
+            WHERE id = ? AND deck_id = ?
+            """,
+            (
+                normalizedKanji,
+                normalizedKana,
+                normalizedEnglish,
+                normalizedNotes,
+                normalizedSchemaKey,
+                uniqueKey,
+                cardId,
+                deckId,
+            ),
+        )
+        connection.commit()
+        return max(cursor.rowcount, 0) > 0
+    except sqlite3.IntegrityError:
+        return False
+
+
 def UpdateCardField(connection: sqlite3.Connection, cardId: str, fieldName: str, value: str) -> None:
     if fieldName not in AllowedCardFieldsToUpdate:
         raise ValueError("Invalid field")
-    connection.execute(f"UPDATE cards SET {fieldName} = ? WHERE id = ?", (value, cardId))
+
+    if fieldName not in {"kanji", "kana", "schema_key"}:
+        connection.execute(f"UPDATE cards SET {fieldName} = ? WHERE id = ?", (value, cardId))
+        connection.commit()
+        return
+
+    cardRow = connection.execute(
+        "SELECT deck_id, schema_key, kanji, kana FROM cards WHERE id = ?",
+        (cardId,),
+    ).fetchone()
+    if cardRow is None:
+        raise RuntimeError("Card not found.")
+
+    updatedSchemaKey = cardRow["schema_key"]
+    updatedKanji = cardRow["kanji"]
+    updatedKana = cardRow["kana"]
+
+    if fieldName == "schema_key":
+        updatedSchemaKey = value
+    elif fieldName == "kanji":
+        updatedKanji = value
+    elif fieldName == "kana":
+        updatedKana = value
+
+    if CardWordExistsInSchema(
+        connection,
+        cardRow["deck_id"],
+        updatedSchemaKey,
+        updatedKanji,
+        updatedKana,
+        excludeCardId=cardId,
+    ):
+        raise sqlite3.IntegrityError("Duplicate word in the selected card format.")
+
+    uniqueKey = BuildCardUniqueKey(updatedSchemaKey, updatedKanji, updatedKana)
+    connection.execute(
+        f"UPDATE cards SET {fieldName} = ?, unique_key = ? WHERE id = ?",
+        (value, uniqueKey, cardId),
+    )
     connection.commit()
 
 
@@ -229,13 +348,32 @@ def UpdateCardsSchemaByIds(
         return 0
 
     placeholders = ", ".join(["?"] * len(cardIds))
-    parameters: List[str] = [schemaKey, deckId, *cardIds]
-    cursor = connection.execute(
-        f"UPDATE cards SET schema_key = ? WHERE deck_id = ? AND id IN ({placeholders})",
-        parameters,
-    )
+    selectedRows = connection.execute(
+        f"SELECT id, kanji, kana FROM cards WHERE deck_id = ? AND id IN ({placeholders})",
+        [deckId, *cardIds],
+    ).fetchall()
+
+    updatedCount = 0
+    for row in selectedRows:
+        if CardWordExistsInSchema(
+            connection,
+            deckId,
+            schemaKey,
+            row["kanji"],
+            row["kana"],
+            excludeCardId=row["id"],
+        ):
+            continue
+
+        uniqueKey = BuildCardUniqueKey(schemaKey, row["kanji"], row["kana"])
+        cursor = connection.execute(
+            "UPDATE cards SET schema_key = ?, unique_key = ? WHERE deck_id = ? AND id = ?",
+            (schemaKey, uniqueKey, deckId, row["id"]),
+        )
+        updatedCount += max(cursor.rowcount, 0)
+
     connection.commit()
-    return max(cursor.rowcount, 0)
+    return updatedCount
 
 
 def DeleteCardsByIds(connection: sqlite3.Connection, deckId: str, cardIds: List[str]) -> int:
@@ -266,12 +404,10 @@ def DeckNameToId(connection: sqlite3.Connection, collectionName: str, deckName: 
 
 
 def DeckHasCandidate(connection: sqlite3.Connection, deckId: str, card: Dict[str, Any]) -> bool:
-    uniqueKey = BuildCardUniqueKey(card.get("kanji", ""), card.get("kana", ""), card.get("english", ""))
-    row = connection.execute(
-        "SELECT 1 FROM cards WHERE deck_id = ? AND unique_key = ?",
-        (deckId, uniqueKey),
-    ).fetchone()
-    return row is not None
+    schemaKey = card.get("schema_key") or "kana_kanji_front_english_back"
+    kanji = card.get("kanji", "")
+    kana = card.get("kana", "")
+    return CardWordExistsInSchema(connection, deckId, schemaKey, kanji, kana)
 
 
 def GetDashboardRows(connection: sqlite3.Connection) -> List[sqlite3.Row]:

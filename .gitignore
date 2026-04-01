@@ -1,6 +1,7 @@
 *.csv
 anki_workspace/media/**
 anki_workspace/exports/**
+anki_workspace/openai_api_debug.log
 **/__pycache__/**
 **.apkg
 **.env

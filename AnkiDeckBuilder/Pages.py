@@ -22,8 +22,8 @@ from AnkiDeckBuilder.DatabaseService import (
     ListDecks,
     RenameCollection,
     RenameDeck,
+    UpdateCardContent,
     UpdateCardField,
-    UpdateCardsSchemaByIds,
     UpdateCardMedia,
 )
 from AnkiDeckBuilder.ExportService import ExportDeckPackage
@@ -34,6 +34,7 @@ from AnkiDeckBuilder.OpenAiService import (
     GenerateEnglishTranslations,
     GetOpenAiClient,
     SupportedWordForms,
+    VerifyCardsAgainstSelection,
 )
 from AnkiDeckBuilder.UiState import BeginBusyAction, EndBusyAction, IsBusy
 from AnkiDeckBuilder.WorkspaceService import CopyUploadedMedia
@@ -354,110 +355,213 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         key=f"BulkFormat_{deck['id']}",
     )
 
-    applyColumn, convertColumn, translateColumn, deleteColumn = st.columns(4)
-    with applyColumn:
-        if st.button(
-            "Apply format to selected cards",
-            disabled=IsBusy() or not selectedCardIds,
-            use_container_width=True,
-        ):
-            updatedCount = UpdateCardsSchemaByIds(connection, deck["id"], selectedCardIds, formatSelection)
-            st.success(f"Updated {updatedCount} card format(s).")
-            st.rerun()
-
     conversionForm = st.selectbox(
         "Japanese word form for selected cards",
         list(SupportedWordForms.keys()),
         format_func=lambda key: SupportedWordForms[key],
         key=f"BulkWordForm_{deck['id']}",
     )
-    with convertColumn:
-        if st.button(
-            "Convert selected cards",
+    requireEnglishTranslation = st.checkbox(
+        "Require English translation",
+        key=f"BulkRequireEnglish_{deck['id']}",
+        help="If checked, missing English is generated for selected cards during Apply.",
+    )
+
+    applyColumn, verifyColumn, confirmDeleteColumn, deleteColumn = st.columns([1.1, 1.1, 1.0, 1.0])
+    with applyColumn:
+        applySubmitted = st.button(
+            "Apply selected changes",
             disabled=IsBusy() or not selectedCardIds,
             use_container_width=True,
-        ):
-            if not BeginBusyAction("Converting selected cards"):
-                st.warning("A request is already in progress.")
-                return
-            progressBar = st.progress(0, text="Preparing conversion...")
-            try:
-                client = GetOpenAiClient()
-                selectedCardsForConversion = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
-                conversions, conversionErrors = ConvertJapaneseWords(
-                    client,
-                    DefaultModel,
-                    selectedCardsForConversion,
-                    conversionForm,
-                    BuildProgressUpdater(progressBar),
-                )
-                convertedCount = 0
-                for item in conversions:
-                    cardId = item["id"]
-                    if cardId not in cardById:
-                        continue
-                    UpdateCardField(connection, cardId, "kanji", item.get("kanji", ""))
-                    UpdateCardField(connection, cardId, "kana", item.get("kana", ""))
-                    convertedCount += 1
-                progressBar.progress(100, text="Selected cards converted.")
-                st.success(f"Converted {convertedCount} selected card(s) to {SupportedWordForms[conversionForm]}.")
-                RenderErrorList(conversionErrors, "Some conversions failed")
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-            finally:
-                EndBusyAction()
-
-    with translateColumn:
-        if st.button(
-            "Generate missing English for selected",
+            type="primary",
+        )
+    with verifyColumn:
+        verifySubmitted = st.button(
+            "Verify selected cards",
             disabled=IsBusy() or not selectedCardIds,
             use_container_width=True,
-        ):
-            if not BeginBusyAction("Generating missing English translations"):
-                st.warning("A request is already in progress.")
-                return
-            progressBar = st.progress(0, text="Preparing translation...")
-            try:
-                client = GetOpenAiClient()
-                selectedCards = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
-                cardsMissingEnglish = [card for card in selectedCards if not (card["english"] or "").strip()]
-                if not cardsMissingEnglish:
-                    st.info("All selected cards already include English translations.")
-                else:
-                    translations, translationErrors = GenerateEnglishTranslations(
-                        client,
-                        DefaultModel,
-                        cardsMissingEnglish,
-                        BuildProgressUpdater(progressBar),
-                    )
-                    updatedCount = 0
-                    for item in translations:
-                        UpdateCardField(connection, item["id"], "english", item["english"])
-                        updatedCount += 1
-                    progressBar.progress(100, text="English translation generation complete.")
-                    st.success(f"Generated English translations for {updatedCount} selected card(s).")
-                    RenderErrorList(translationErrors, "Translation errors")
-                    st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-            finally:
-                EndBusyAction()
-
-    with deleteColumn:
+        )
+    with confirmDeleteColumn:
         confirmDelete = st.checkbox(
             "Confirm delete selected cards",
             key=f"ConfirmDelete_{deck['id']}",
         )
-        if st.button(
+    with deleteColumn:
+        deleteSubmitted = st.button(
             "Delete selected cards",
             disabled=IsBusy() or not selectedCardIds or not confirmDelete,
-            type="primary",
             use_container_width=True,
-        ):
-            deletedCount = DeleteCardsByIds(connection, deck["id"], selectedCardIds)
-            st.success(f"Deleted {deletedCount} card(s).")
+        )
+
+    if applySubmitted:
+        if not BeginBusyAction("Applying bulk changes"):
+            st.warning("A request is already in progress.")
+            return
+
+        progressBar = st.progress(0, text="Applying bulk changes...")
+        try:
+            selectedCardsForApply = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
+            cardUpdatesById: Dict[str, Dict[str, str]] = {
+                card["id"]: {
+                    "kanji": card["kanji"],
+                    "kana": card["kana"],
+                    "english": card["english"],
+                    "notes": card["notes"],
+                    "schema_key": formatSelection,
+                }
+                for card in selectedCardsForApply
+            }
+
+            client = GetOpenAiClient()
+            conversions, conversionErrors = ConvertJapaneseWords(
+                client,
+                DefaultModel,
+                selectedCardsForApply,
+                conversionForm,
+                BuildProgressUpdater(progressBar),
+            )
+            convertedCount = 0
+            for item in conversions:
+                cardId = item["id"]
+                if cardId not in cardUpdatesById:
+                    continue
+                currentKanji = cardUpdatesById[cardId]["kanji"]
+                currentKana = cardUpdatesById[cardId]["kana"]
+                nextKanji = item.get("kanji", currentKanji)
+                nextKana = item.get("kana", currentKana)
+                if nextKanji != currentKanji or nextKana != currentKana:
+                    convertedCount += 1
+                cardUpdatesById[cardId]["kanji"] = nextKanji
+                cardUpdatesById[cardId]["kana"] = nextKana
+
+            translatedCount = 0
+            translationErrors: List[str] = []
+            cardsMissingEnglish = []
+            for card in selectedCardsForApply:
+                updated = cardUpdatesById[card["id"]]
+                if not (updated["english"] or "").strip():
+                    cardsMissingEnglish.append(
+                        {
+                            "id": card["id"],
+                            "kanji": updated["kanji"],
+                            "kana": updated["kana"],
+                            "source_text": card["source_text"],
+                            "notes": card["notes"],
+                        }
+                    )
+
+            if requireEnglishTranslation and cardsMissingEnglish:
+                translations, translationErrors = GenerateEnglishTranslations(
+                    client,
+                    DefaultModel,
+                    cardsMissingEnglish,
+                    BuildProgressUpdater(progressBar),
+                )
+                for item in translations:
+                    cardId = item["id"]
+                    if cardId not in cardUpdatesById:
+                        continue
+                    currentEnglish = cardUpdatesById[cardId]["english"]
+                    nextEnglish = item["english"]
+                    if currentEnglish != nextEnglish:
+                        translatedCount += 1
+                    cardUpdatesById[cardId]["english"] = nextEnglish
+
+            appliedCount = 0
+            duplicateSkippedCount = 0
+            for card in selectedCardsForApply:
+                updated = cardUpdatesById[card["id"]]
+                isApplied = UpdateCardContent(
+                    connection,
+                    deck["id"],
+                    card["id"],
+                    updated["kanji"],
+                    updated["kana"],
+                    updated["english"],
+                    updated["notes"],
+                    updated["schema_key"],
+                )
+                if isApplied:
+                    appliedCount += 1
+                else:
+                    duplicateSkippedCount += 1
+
+            progressBar.progress(100, text="Bulk changes applied.")
+            statusParts = [
+                f"Applied changes to {appliedCount} card(s)",
+                f"converted {convertedCount} card(s) to {SupportedWordForms[conversionForm]}",
+            ]
+            if requireEnglishTranslation:
+                statusParts.append(f"generated English for {translatedCount} card(s)")
+            if duplicateSkippedCount:
+                statusParts.append(f"skipped {duplicateSkippedCount} duplicate word(s) in the selected format")
+            st.success("; ".join(statusParts) + ".")
+            if requireEnglishTranslation and not cardsMissingEnglish:
+                st.info("All selected cards already include English translations.")
+            RenderErrorList(conversionErrors, "Some conversions failed")
+            RenderErrorList(translationErrors, "Translation errors")
             st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+        finally:
+            EndBusyAction()
+
+    if verifySubmitted:
+        if not BeginBusyAction("Verifying selected cards"):
+            st.warning("A request is already in progress.")
+            return
+
+        progressBar = st.progress(0, text="Verifying selected cards...")
+        try:
+            selectedCardsForVerify = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
+            client = GetOpenAiClient()
+            verifiedCards, verificationErrors = VerifyCardsAgainstSelection(
+                client,
+                DefaultModel,
+                selectedCardsForVerify,
+                conversionForm,
+                formatSelection,
+                BuildProgressUpdater(progressBar),
+            )
+            verifiedById = {item["id"]: item for item in verifiedCards}
+
+            verifiedCount = 0
+            duplicateSkippedCount = 0
+            for card in selectedCardsForVerify:
+                verified = verifiedById.get(card["id"])
+                if not verified:
+                    continue
+                isApplied = UpdateCardContent(
+                    connection,
+                    deck["id"],
+                    card["id"],
+                    verified["kanji"],
+                    verified["kana"],
+                    verified["english"],
+                    verified["notes"],
+                    formatSelection,
+                )
+                if isApplied:
+                    verifiedCount += 1
+                else:
+                    duplicateSkippedCount += 1
+
+            progressBar.progress(100, text="Verification complete.")
+            statusParts = [f"Verified and updated {verifiedCount} card(s)"]
+            if duplicateSkippedCount:
+                statusParts.append(f"skipped {duplicateSkippedCount} duplicate word(s) in the selected format")
+            st.success("; ".join(statusParts) + ".")
+            RenderErrorList(verificationErrors, "Verification issues")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+        finally:
+            EndBusyAction()
+
+    if deleteSubmitted:
+        deletedCount = DeleteCardsByIds(connection, deck["id"], selectedCardIds)
+        st.success(f"Deleted {deletedCount} card(s).")
+        st.rerun()
 
     selectedCards = [cardById[cardId] for cardId in selectedCardIds if cardId in cardById]
     if len(selectedCards) != 1:
@@ -491,13 +595,21 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
         )
         submitted = st.form_submit_button("Save text changes", disabled=IsBusy())
         if submitted:
-            UpdateCardField(connection, card["id"], "kanji", kanji)
-            UpdateCardField(connection, card["id"], "kana", kana)
-            UpdateCardField(connection, card["id"], "english", english)
-            UpdateCardField(connection, card["id"], "notes", notes)
-            UpdateCardField(connection, card["id"], "schema_key", schemaKey)
-            st.success("Card updated.")
-            st.rerun()
+            isUpdated = UpdateCardContent(
+                connection,
+                deck["id"],
+                card["id"],
+                kanji,
+                kana,
+                english,
+                notes,
+                schemaKey,
+            )
+            if isUpdated:
+                st.success("Card updated.")
+                st.rerun()
+            else:
+                st.warning("Update skipped: duplicate word already exists in this format.")
 
     with st.form("GenerateMissingEnglishForm"):
         st.caption("Generate English translation if this card is missing English text.")
@@ -522,14 +634,23 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
                 for item in translations:
                     if item["id"] != card["id"]:
                         continue
-                    UpdateCardField(connection, card["id"], "english", item["english"])
-                    generatedCount += 1
+                    isUpdated = UpdateCardContent(
+                        connection,
+                        deck["id"],
+                        card["id"],
+                        card["kanji"],
+                        card["kana"],
+                        item["english"],
+                        card["notes"],
+                        card["schema_key"],
+                    )
+                    generatedCount += int(isUpdated)
                 progressBar.progress(100, text="English translation generation complete.")
                 if generatedCount > 0:
                     st.success("Generated English translation for this card.")
                     st.rerun()
                 else:
-                    st.warning("No translation was generated.")
+                    st.warning("No translation was generated (or update was skipped as duplicate).")
                 RenderErrorList(translationErrors, "Translation errors")
             except Exception as exc:
                 st.error(str(exc))
@@ -550,12 +671,15 @@ def RenderReviewCardsPage(connection: sqlite3.Connection) -> None:
             if replaceTarget == "none" or not uploads:
                 st.warning("Pick a target and upload at least one media file.")
             else:
-                savedPaths = [CopyUploadedMedia(upload, deck["id"]) for upload in uploads]
-                if replaceTarget in {"english", "kana", "kanji"}:
-                    UpdateCardField(connection, card["id"], replaceTarget, f"[{mediaType.upper()}]")
-                UpdateCardMedia(connection, card["id"], mediaType, savedPaths)
-                st.success("Media attached to card.")
-                st.rerun()
+                try:
+                    savedPaths = [CopyUploadedMedia(upload, deck["id"]) for upload in uploads]
+                    if replaceTarget in {"english", "kana", "kanji"}:
+                        UpdateCardField(connection, card["id"], replaceTarget, f"[{mediaType.upper()}]")
+                    UpdateCardMedia(connection, card["id"], mediaType, savedPaths)
+                    st.success("Media attached to card.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Media replacement skipped: duplicate word already exists in this format.")
 
 
 def RenderScanImagesPage(connection: sqlite3.Connection) -> None:

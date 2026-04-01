@@ -26,6 +26,11 @@ CardSchemas = {
         "FrontFields": ["kanji"],
         "BackFields": ["kana", "english"],
     },
+    "kanji_okurigana_front_reading_english_back": {
+        "Label": "Front: Kanji With Okurigana | Back: Full Reading + English",
+        "FrontFields": ["kanji"],
+        "BackFields": ["kana", "english"],
+    },
     "kana_front_kanji_english_back": {
         "Label": "Front: Hiragana/Katakana | Back: Kanji + English",
         "FrontFields": ["kana"],
@@ -86,4 +91,3 @@ Rules:
 - If kana or english are uncertain, do your best but keep visible_text exact.
 - Do not include duplicates.
 """.strip()
-
