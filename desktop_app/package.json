@@ -1,0 +1,25 @@
+{
+  "name": "desktop_app",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "tauri": "python scripts/run_tauri.py",
+    "tauri:dev": "npm run sidecar:build && python scripts/run_tauri.py dev",
+    "sidecar:build": "python scripts/build_sidecar.py",
+    "tauri:build": "python scripts/run_tauri.py build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/plugin-dialog": "^2.4.1",
+    "@nuxt/ui": "^3.3.3",
+    "nuxt": "^4.4.2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  }
+}

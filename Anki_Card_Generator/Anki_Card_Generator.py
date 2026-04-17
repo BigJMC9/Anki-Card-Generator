@@ -173,6 +173,7 @@ ReviewMediaTypeOptions = [
 PracticeGameModeOptions = [
     {"key": "verb_sort", "label": "Verb Sort (Ichidan vs Godan)"},
     {"key": "adjective_sort", "label": "Adjective Sort (い vs な)"},
+    {"key": "te_form", "label": "Te Form Builder"},
 ]
 PracticeVerbBucketOptions = [
     {"key": "ichidan", "label": "Ichidan"},
@@ -270,6 +271,32 @@ def DetectPracticeVerbBucket(card: Any) -> str:
     return ""
 
 
+def DetectPracticeVerbType(card: Any) -> str:
+    verbType = GetCardText(card, "verb_type")
+    if verbType in {"ichidan", "godan", "suru", "suru_noun", "kuru"}:
+        return verbType
+
+    posText = GetCardText(card, "dictionary_pos").lower()
+    if "kuru verb" in posText:
+        return "kuru"
+    if "noun or participle which takes the aux. verb suru" in posText:
+        return "suru_noun"
+    if "suru verb" in posText:
+        return "suru"
+    if "ichidan verb" in posText:
+        return "ichidan"
+    if "godan verb" in posText:
+        return "godan"
+
+    dictionaryReading = GetCardText(card, "dictionary_reading") or GetCardText(card, "kana")
+    dictionaryHeadword = GetCardText(card, "dictionary_headword") or GetCardText(card, "kanji")
+    if dictionaryReading.endswith("する") or dictionaryHeadword.endswith("する"):
+        return "suru"
+    if dictionaryReading.endswith("くる") or dictionaryHeadword.endswith("来る"):
+        return "kuru"
+    return ""
+
+
 def DetectPracticeAdjectiveBucket(card: Any) -> str:
     posText = GetCardText(card, "dictionary_pos").lower()
     if "adjective (keiyoushi)" in posText or "i-adjective" in posText:
@@ -294,6 +321,11 @@ def BuildPracticeDedupeKey(card: Any, bucket: str) -> str:
             GetCardText(card, "dictionary_reading") or GetCardText(card, "kana"),
         ]
     )
+
+
+def NormalizePracticeAnswer(value: str) -> str:
+    normalized = str(value or "").strip()
+    return "".join(normalized.split())
 
 
 def DetectInlineWordKind(entry: Dict[str, Any]) -> str:
@@ -503,6 +535,7 @@ class AnkiAppState(rx.State):
     practice_last_speed_bonus: int = 0
     practice_last_result_message: str = ""
     practice_answer_rows: List[Dict[str, Any]] = []
+    practice_te_form_input: str = ""
 
     single_edit_card_id: str = ""
     single_edit_kanji: str = ""
@@ -1337,14 +1370,21 @@ class AnkiAppState(rx.State):
     def practice_answer_result_rows(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for entry in self.practice_answer_rows:
+            mode = str(entry.get("mode", "") or "")
             expectedKey = str(entry.get("expected", "") or "")
             selectedKey = str(entry.get("selected", "") or "")
+            if mode == "te_form":
+                expectedLabel = str(entry.get("expected_display", "") or expectedKey)
+                selectedLabel = str(entry.get("selected_display", "") or selectedKey)
+            else:
+                expectedLabel = PracticeBucketLabels.get(expectedKey, expectedKey)
+                selectedLabel = PracticeBucketLabels.get(selectedKey, selectedKey)
             rows.append(
                 {
                     "prompt": str(entry.get("prompt", "") or ""),
                     "hint": str(entry.get("hint", "") or ""),
-                    "expected_label": PracticeBucketLabels.get(expectedKey, expectedKey),
-                    "selected_label": PracticeBucketLabels.get(selectedKey, selectedKey),
+                    "expected_label": expectedLabel,
+                    "selected_label": selectedLabel,
                     "result_label": "Correct" if bool(entry.get("correct", False)) else "Incorrect",
                     "elapsed_label": f"{float(entry.get('elapsed_seconds', 0.0) or 0.0)}s",
                     "delta_label": f"{int(entry.get('delta_points', 0) or 0):+d}",
@@ -1403,8 +1443,66 @@ class AnkiAppState(rx.State):
         for card in GetDeckCards(GetConnection(), deckId):
             if mode == "verb_sort":
                 bucket = DetectPracticeVerbBucket(card)
-            else:
+            elif mode == "adjective_sort":
                 bucket = DetectPracticeAdjectiveBucket(card)
+            else:
+                verbType = DetectPracticeVerbType(card)
+                if not verbType:
+                    continue
+                baseWord = GetCardText(card, "dictionary_headword") or GetCardText(card, "kanji")
+                baseReading = GetCardText(card, "dictionary_reading") or GetCardText(card, "kana")
+                if not baseReading:
+                    continue
+                if not baseWord:
+                    baseWord = baseReading
+
+                forms = BuildExtendedVerbForms(
+                    {
+                        "headword": baseWord,
+                        "reading": baseReading,
+                        "verb_type": verbType,
+                    }
+                )
+                expectedWord = (forms.get("te", {}).get("word", "") or "").strip()
+                expectedReading = (forms.get("te", {}).get("reading", "") or "").strip()
+                if not expectedWord and not expectedReading:
+                    continue
+
+                acceptedAnswers = []
+                for answer in [expectedWord, expectedReading]:
+                    normalizedAnswer = NormalizePracticeAnswer(answer)
+                    if normalizedAnswer and normalizedAnswer not in acceptedAnswers:
+                        acceptedAnswers.append(normalizedAnswer)
+
+                if not acceptedAnswers:
+                    continue
+
+                dedupeKey = BuildPracticeDedupeKey(card, "te_form")
+                if dedupeKey in seenKeys:
+                    continue
+                seenKeys.add(dedupeKey)
+
+                prompt = BuildPracticePrompt(card)
+                if not prompt:
+                    continue
+
+                expectedDisplay = expectedWord
+                if expectedWord and expectedReading and expectedWord != expectedReading:
+                    expectedDisplay = f"{expectedWord} [{expectedReading}]"
+                elif not expectedDisplay:
+                    expectedDisplay = expectedReading
+
+                rows.append(
+                    {
+                        "id": dedupeKey,
+                        "prompt": prompt,
+                        "hint": BuildPracticeHint(card),
+                        "expected": expectedDisplay,
+                        "expected_display": expectedDisplay,
+                        "accepted_answers": acceptedAnswers,
+                    }
+                )
+                continue
             if not bucket:
                 continue
 
@@ -1853,9 +1951,16 @@ class AnkiAppState(rx.State):
         self.revision_show_back = not self.revision_show_back
 
     def set_practice_game_mode(self, mode: str) -> None:
-        if mode not in {"verb_sort", "adjective_sort"}:
+        if mode not in {"verb_sort", "adjective_sort", "te_form"}:
+            return
+        if self.practice_round_active and mode != self.practice_game_mode:
+            self._set_status("warning", "Stop the current round before switching game modes.")
             return
         self.practice_game_mode = mode
+        self.practice_te_form_input = ""
+
+    def set_practice_te_form_input(self, value: str) -> None:
+        self.practice_te_form_input = str(value or "")
 
     def start_practice_round(self) -> None:
         deckId = self._active_practice_deck_id()
@@ -1867,6 +1972,8 @@ class AnkiAppState(rx.State):
         if not roundCards:
             if self.practice_game_mode == "verb_sort":
                 self._set_status("warning", "No Ichidan/Godan verb cards found in this deck.")
+            elif self.practice_game_mode == "te_form":
+                self._set_status("warning", "No verb cards with usable dictionary/te forms found in this deck.")
             else:
                 self._set_status("warning", "No い/な adjective cards found in this deck.")
             return
@@ -1887,6 +1994,7 @@ class AnkiAppState(rx.State):
         self.practice_last_speed_bonus = 0
         self.practice_last_result_message = ""
         self.practice_answer_rows = []
+        self.practice_te_form_input = ""
         self._set_status("info", f"Started {self.practice_mode_label} with {len(roundCards)} card(s).")
 
     def stop_practice_round(self) -> None:
@@ -1895,12 +2003,14 @@ class AnkiAppState(rx.State):
         self.practice_round_active = False
         if self.practice_round_started_at > 0:
             self.practice_round_elapsed_seconds = round(time.time() - self.practice_round_started_at, 2)
+        self.practice_te_form_input = ""
         self.practice_last_result_message = "Round stopped."
 
     def _complete_practice_round(self) -> None:
         self.practice_round_active = False
         if self.practice_round_started_at > 0:
             self.practice_round_elapsed_seconds = round(time.time() - self.practice_round_started_at, 2)
+        self.practice_te_form_input = ""
         self.practice_last_result_message = "Round complete."
         self._set_status(
             "success",
@@ -1955,6 +2065,7 @@ class AnkiAppState(rx.State):
             )
 
         answerRow = {
+            "mode": self.practice_game_mode,
             "prompt": str(currentCard.get("prompt", "") or ""),
             "hint": str(currentCard.get("hint", "") or ""),
             "expected": expectedBucket,
@@ -1964,6 +2075,73 @@ class AnkiAppState(rx.State):
             "delta_points": deltaPoints,
         }
         self.practice_answer_rows = [*self.practice_answer_rows, answerRow]
+
+        self.practice_round_index += 1
+        if self.practice_round_index >= len(self.practice_round_cards):
+            self._complete_practice_round()
+            return
+        self.practice_question_started_at = time.time()
+
+    def submit_te_form_answer(self) -> None:
+        if not self.practice_round_active:
+            self._set_status("warning", "Start a game round first.")
+            return
+        if self.practice_game_mode != "te_form":
+            return
+        if self.practice_round_index >= len(self.practice_round_cards):
+            self._complete_practice_round()
+            return
+
+        submittedRaw = str(self.practice_te_form_input or "")
+        submittedDisplay = submittedRaw.strip()
+        submittedNormalized = NormalizePracticeAnswer(submittedDisplay)
+        if not submittedNormalized:
+            self._set_status("warning", "Type a て-form answer first.")
+            return
+
+        now = time.time()
+        currentCard = self.practice_round_cards[self.practice_round_index]
+        acceptedAnswers = list(currentCard.get("accepted_answers", []) or [])
+        expectedDisplay = str(currentCard.get("expected_display", "") or currentCard.get("expected", "") or "")
+        elapsedSeconds = max(0.0, now - self.practice_question_started_at)
+        speedBonus = self._calculate_speed_bonus(elapsedSeconds)
+        wasCorrect = submittedNormalized in acceptedAnswers
+        deltaPoints = 0
+
+        if wasCorrect:
+            self.practice_streak += 1
+            self.practice_best_streak = max(self.practice_best_streak, self.practice_streak)
+            streakBonus = min((self.practice_streak - 1) * 2, 12)
+            deltaPoints = PracticeBaseCorrectPoints + speedBonus + streakBonus
+            self.practice_score += deltaPoints
+            self.practice_correct_count += 1
+            self.practice_last_speed_bonus = speedBonus
+            self.practice_last_result_message = (
+                f"Correct. +{deltaPoints} points "
+                f"(speed +{speedBonus}, streak {self.practice_streak})."
+            )
+        else:
+            self.practice_streak = 0
+            deltaPoints = -PracticeIncorrectPenaltyPoints
+            self.practice_score = max(0, self.practice_score + deltaPoints)
+            self.practice_incorrect_count += 1
+            self.practice_last_speed_bonus = 0
+            self.practice_last_result_message = f"Incorrect. Expected {expectedDisplay}. {deltaPoints} points."
+
+        answerRow = {
+            "mode": "te_form",
+            "prompt": str(currentCard.get("prompt", "") or ""),
+            "hint": str(currentCard.get("hint", "") or ""),
+            "expected": expectedDisplay,
+            "selected": submittedDisplay,
+            "expected_display": expectedDisplay,
+            "selected_display": submittedDisplay,
+            "correct": wasCorrect,
+            "elapsed_seconds": round(elapsedSeconds, 2),
+            "delta_points": deltaPoints,
+        }
+        self.practice_answer_rows = [*self.practice_answer_rows, answerRow]
+        self.practice_te_form_input = ""
 
         self.practice_round_index += 1
         if self.practice_round_index >= len(self.practice_round_cards):
@@ -4416,7 +4594,7 @@ def cards_page() -> rx.Component:
 def revision_and_games_panel() -> rx.Component:
     return section_box(
         "Revision + Games",
-        "Flip through deck cards, then play timed sorting rounds with streak and speed bonuses.",
+        "Flip through deck cards, then play timed rounds with streak and speed bonuses.",
         rx.hstack(
             rx.text("Practice Deck:", color=ThemeStyles["MutedText"]),
             rx.cond(
@@ -4501,7 +4679,7 @@ def revision_and_games_panel() -> rx.Component:
             gap="8px",
         ),
         rx.box(height="1px", width="100%", background="#2a3b52"),
-        rx.text("Sorting Games", weight="bold"),
+        rx.text("Practice Games", weight="bold"),
         rx.flex(
             *[
                 choice_button(
@@ -4601,22 +4779,42 @@ def revision_and_games_panel() -> rx.Component:
                     wrap="wrap",
                     gap="8px",
                 ),
-                rx.hstack(
-                    rx.button(
-                        "I-adjective (い)",
-                        on_click=AnkiAppState.answer_practice_round("i_adj"),
-                        disabled=AnkiAppState.is_busy,
-                        width="170px",
+                rx.cond(
+                    AnkiAppState.practice_game_mode == "adjective_sort",
+                    rx.hstack(
+                        rx.button(
+                            "I-adjective (い)",
+                            on_click=AnkiAppState.answer_practice_round("i_adj"),
+                            disabled=AnkiAppState.is_busy,
+                            width="170px",
+                        ),
+                        rx.button(
+                            "Na-adjective (な)",
+                            on_click=AnkiAppState.answer_practice_round("na_adj"),
+                            disabled=AnkiAppState.is_busy,
+                            width="170px",
+                        ),
+                        width="100%",
+                        wrap="wrap",
+                        gap="8px",
                     ),
-                    rx.button(
-                        "Na-adjective (な)",
-                        on_click=AnkiAppState.answer_practice_round("na_adj"),
-                        disabled=AnkiAppState.is_busy,
-                        width="170px",
+                    rx.hstack(
+                        rx.input(
+                            value=AnkiAppState.practice_te_form_input,
+                            on_change=AnkiAppState.set_practice_te_form_input,
+                            placeholder="Type the correct て-form",
+                            width="100%",
+                        ),
+                        rx.button(
+                            "Submit",
+                            on_click=AnkiAppState.submit_te_form_answer,
+                            disabled=AnkiAppState.is_busy,
+                            width="120px",
+                        ),
+                        width="100%",
+                        wrap="wrap",
+                        gap="8px",
                     ),
-                    width="100%",
-                    wrap="wrap",
-                    gap="8px",
                 ),
             ),
         ),

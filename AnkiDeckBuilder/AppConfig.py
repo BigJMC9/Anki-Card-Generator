@@ -1,8 +1,9 @@
+import os
 from pathlib import Path
 
 AppTitle = "Japanese Anki Deck Builder"
 
-AppDir = Path("./anki_workspace")
+AppDir = Path(os.getenv("ANKI_APP_DIR", "./anki_workspace")).expanduser().resolve()
 CollectionsDir = AppDir / "collections"
 MediaDir = AppDir / "media"
 TempDir = AppDir / "tmp"
