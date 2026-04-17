@@ -1,5 +1,7 @@
 import json
+import random
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -168,6 +170,26 @@ ReviewMediaTypeOptions = [
     {"key": "audio", "label": "Audio"},
     {"key": "video", "label": "Video"},
 ]
+PracticeGameModeOptions = [
+    {"key": "verb_sort", "label": "Verb Sort (Ichidan vs Godan)"},
+    {"key": "adjective_sort", "label": "Adjective Sort (い vs な)"},
+]
+PracticeVerbBucketOptions = [
+    {"key": "ichidan", "label": "Ichidan"},
+    {"key": "godan", "label": "Godan"},
+]
+PracticeAdjectiveBucketOptions = [
+    {"key": "i_adj", "label": "I-adjective (い)"},
+    {"key": "na_adj", "label": "Na-adjective (な)"},
+]
+PracticeBucketLabels = {
+    "ichidan": "Ichidan",
+    "godan": "Godan",
+    "i_adj": "I-adjective (い)",
+    "na_adj": "Na-adjective (な)",
+}
+PracticeBaseCorrectPoints = 10
+PracticeIncorrectPenaltyPoints = 2
 ExtendedVerbFormLabels = {
     "dictionary": "Dictionary form",
     "masu": "Masu form",
@@ -200,6 +222,78 @@ GodanARowMap = {
     "む": "ま",
     "る": "ら",
 }
+
+
+def GetCardText(card: Any, fieldName: str) -> str:
+    try:
+        value = card[fieldName]
+    except Exception:
+        if isinstance(card, dict):
+            value = card.get(fieldName, "")
+        else:
+            value = ""
+    return str(value or "").strip()
+
+
+def BuildCardFaceText(card: Any, fieldNames: List[str]) -> str:
+    values: List[str] = []
+    for fieldName in fieldNames:
+        text = GetCardText(card, fieldName)
+        if text and text not in values:
+            values.append(text)
+    return " | ".join(values)
+
+
+def BuildPracticePrompt(card: Any) -> str:
+    baseWord = GetCardText(card, "dictionary_headword") or GetCardText(card, "kanji")
+    baseReading = GetCardText(card, "dictionary_reading") or GetCardText(card, "kana")
+    if baseWord and baseReading and baseWord != baseReading:
+        return f"{baseWord} [{baseReading}]"
+    return baseWord or baseReading
+
+
+def BuildPracticeHint(card: Any) -> str:
+    english = GetCardText(card, "dictionary_gloss") or GetCardText(card, "english")
+    return english
+
+
+def DetectPracticeVerbBucket(card: Any) -> str:
+    verbType = GetCardText(card, "verb_type")
+    if verbType in {"ichidan", "godan"}:
+        return verbType
+
+    posText = GetCardText(card, "dictionary_pos").lower()
+    if "ichidan verb" in posText:
+        return "ichidan"
+    if "godan verb" in posText:
+        return "godan"
+    return ""
+
+
+def DetectPracticeAdjectiveBucket(card: Any) -> str:
+    posText = GetCardText(card, "dictionary_pos").lower()
+    if "adjective (keiyoushi)" in posText or "i-adjective" in posText:
+        return "i_adj"
+    if "adjectival noun" in posText or "adjectival nouns" in posText or "na-adjective" in posText:
+        return "na_adj"
+
+    checkText = GetCardText(card, "dictionary_reading") or GetCardText(card, "kana") or GetCardText(card, "kanji")
+    if checkText.endswith("い") and not checkText.endswith("ない"):
+        return "i_adj"
+    return ""
+
+
+def BuildPracticeDedupeKey(card: Any, bucket: str) -> str:
+    dictionaryEntryId = GetCardText(card, "dictionary_entry_id")
+    if dictionaryEntryId:
+        return f"{dictionaryEntryId}:{bucket}"
+    return "|".join(
+        [
+            bucket,
+            GetCardText(card, "dictionary_headword") or GetCardText(card, "kanji"),
+            GetCardText(card, "dictionary_reading") or GetCardText(card, "kana"),
+        ]
+    )
 
 
 def DetectInlineWordKind(entry: Dict[str, Any]) -> str:
@@ -389,6 +483,26 @@ class AnkiAppState(rx.State):
     review_selected_card_ids: List[str] = []
     review_bulk_format: str = "kana_kanji_front_english_back"
     review_confirm_delete: bool = False
+
+    revision_card_index: int = 0
+    revision_show_back: bool = False
+
+    practice_game_mode: str = "verb_sort"
+    practice_round_active: bool = False
+    practice_round_deck_id: str = ""
+    practice_round_cards: List[Dict[str, Any]] = []
+    practice_round_index: int = 0
+    practice_round_started_at: float = 0.0
+    practice_question_started_at: float = 0.0
+    practice_round_elapsed_seconds: float = 0.0
+    practice_score: int = 0
+    practice_correct_count: int = 0
+    practice_incorrect_count: int = 0
+    practice_streak: int = 0
+    practice_best_streak: int = 0
+    practice_last_speed_bonus: int = 0
+    practice_last_result_message: str = ""
+    practice_answer_rows: List[Dict[str, Any]] = []
 
     single_edit_card_id: str = ""
     single_edit_kanji: str = ""
@@ -1067,6 +1181,178 @@ class AnkiAppState(rx.State):
     def has_scan_errors(self) -> bool:
         return bool(self.scan_errors)
 
+    @rx.var
+    def practice_mode_label(self) -> str:
+        for option in PracticeGameModeOptions:
+            if option["key"] == self.practice_game_mode:
+                return option["label"]
+        return PracticeGameModeOptions[0]["label"]
+
+    @rx.var
+    def practice_target_deck_id(self) -> str:
+        return self._active_practice_deck_id()
+
+    @rx.var
+    def practice_target_deck_label(self) -> str:
+        return self._deck_label_by_id(self.practice_target_deck_id)
+
+    @rx.var(cache=False)
+    def revision_card_rows(self) -> List[Dict[str, Any]]:
+        deckId = self._active_practice_deck_id()
+        if not deckId:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        cards = GetDeckCards(GetConnection(), deckId)
+        for card in cards:
+            schemaKey = (card["schema_key"] or "").strip()
+            schema = CardSchemas.get(schemaKey, {})
+            frontFields = schema.get("FrontFields", ["kana", "kanji"])
+            backFields = schema.get("BackFields", ["english"])
+            frontText = BuildCardFaceText(card, frontFields) or BuildCardFaceText(card, ["kana", "kanji"])
+            backText = BuildCardFaceText(card, backFields) or BuildCardFaceText(card, ["english", "kana", "kanji"])
+
+            rows.append(
+                {
+                    "id": card["id"],
+                    "front": frontText,
+                    "back": backText,
+                    "notes": (card["notes"] or "").strip(),
+                    "schema_label": CardSchemas.get(schemaKey, {}).get("Label", schemaKey),
+                    "word_form": (card["word_form"] or "dictionary").strip() or "dictionary",
+                }
+            )
+        return rows
+
+    @rx.var
+    def has_revision_cards(self) -> bool:
+        return bool(self.revision_card_rows)
+
+    @rx.var
+    def revision_total_cards(self) -> int:
+        return len(self.revision_card_rows)
+
+    @rx.var
+    def revision_current_card(self) -> Dict[str, Any]:
+        rows = self.revision_card_rows
+        if not rows:
+            return {}
+        safeIndex = min(max(self.revision_card_index, 0), len(rows) - 1)
+        return rows[safeIndex]
+
+    @rx.var
+    def has_revision_current_card(self) -> bool:
+        return bool(self.revision_current_card)
+
+    @rx.var
+    def revision_progress_label(self) -> str:
+        total = self.revision_total_cards
+        if total <= 0:
+            return "0 / 0"
+        safeIndex = min(max(self.revision_card_index, 0), total - 1)
+        return f"{safeIndex + 1} / {total}"
+
+    @rx.var
+    def revision_face_label(self) -> str:
+        return "Back" if self.revision_show_back else "Front"
+
+    @rx.var
+    def revision_face_text(self) -> str:
+        current = self.revision_current_card
+        if not current:
+            return ""
+        return current.get("back", "") if self.revision_show_back else current.get("front", "")
+
+    @rx.var
+    def revision_meta_text(self) -> str:
+        current = self.revision_current_card
+        if not current:
+            return ""
+        return f"{current.get('schema_label', '')} | Word form: {current.get('word_form', 'dictionary')}"
+
+    @rx.var
+    def revision_note_preview(self) -> str:
+        current = self.revision_current_card
+        if not current:
+            return ""
+        return current.get("notes", "")
+
+    @rx.var
+    def practice_round_total(self) -> int:
+        return len(self.practice_round_cards)
+
+    @rx.var
+    def practice_progress_label(self) -> str:
+        total = self.practice_round_total
+        if total <= 0:
+            return "0 / 0"
+        if self.practice_round_active:
+            safeIndex = min(max(self.practice_round_index, 0), total - 1)
+            return f"{safeIndex + 1} / {total}"
+        return f"{total} / {total}"
+
+    @rx.var
+    def has_active_practice_prompt(self) -> bool:
+        return self.practice_round_active and self.practice_round_index < len(self.practice_round_cards)
+
+    @rx.var
+    def practice_current_round_card(self) -> Dict[str, Any]:
+        if not self.has_active_practice_prompt:
+            return {}
+        return self.practice_round_cards[self.practice_round_index]
+
+    @rx.var
+    def practice_current_prompt(self) -> str:
+        return self.practice_current_round_card.get("prompt", "")
+
+    @rx.var
+    def practice_current_hint(self) -> str:
+        return self.practice_current_round_card.get("hint", "")
+
+    @rx.var
+    def practice_summary_visible(self) -> bool:
+        return bool(self.practice_answer_rows) and not self.practice_round_active
+
+    @rx.var
+    def practice_answer_count(self) -> int:
+        return len(self.practice_answer_rows)
+
+    @rx.var
+    def practice_accuracy_percent(self) -> int:
+        attempts = self.practice_correct_count + self.practice_incorrect_count
+        if attempts <= 0:
+            return 0
+        return int(round((self.practice_correct_count / attempts) * 100))
+
+    @rx.var
+    def practice_average_seconds(self) -> float:
+        if not self.practice_answer_rows:
+            return 0.0
+        totalSeconds = 0.0
+        for row in self.practice_answer_rows:
+            totalSeconds += float(row.get("elapsed_seconds", 0.0) or 0.0)
+        return round(totalSeconds / len(self.practice_answer_rows), 2)
+
+    @rx.var
+    def practice_answer_result_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for entry in self.practice_answer_rows:
+            expectedKey = str(entry.get("expected", "") or "")
+            selectedKey = str(entry.get("selected", "") or "")
+            rows.append(
+                {
+                    "prompt": str(entry.get("prompt", "") or ""),
+                    "hint": str(entry.get("hint", "") or ""),
+                    "expected_label": PracticeBucketLabels.get(expectedKey, expectedKey),
+                    "selected_label": PracticeBucketLabels.get(selectedKey, selectedKey),
+                    "result_label": "Correct" if bool(entry.get("correct", False)) else "Incorrect",
+                    "elapsed_label": f"{float(entry.get('elapsed_seconds', 0.0) or 0.0)}s",
+                    "delta_label": f"{int(entry.get('delta_points', 0) or 0):+d}",
+                    "correct": bool(entry.get("correct", False)),
+                }
+            )
+        return rows
+
     def initialize(self) -> None:
         EnsureWorkspaceDirectories()
         GetConnection()
@@ -1102,6 +1388,56 @@ class AnkiAppState(rx.State):
             if option["id"] == deckId:
                 return option["label"]
         return ""
+
+    def _active_practice_deck_id(self) -> str:
+        if self.context_scope != "deck":
+            return ""
+        return (self.context_deck_id or self.review_deck_id or self.scan_deck_id or "").strip()
+
+    def _build_practice_round_cards(self, deckId: str, mode: str) -> List[Dict[str, Any]]:
+        if not deckId:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        seenKeys = set()
+        for card in GetDeckCards(GetConnection(), deckId):
+            if mode == "verb_sort":
+                bucket = DetectPracticeVerbBucket(card)
+            else:
+                bucket = DetectPracticeAdjectiveBucket(card)
+            if not bucket:
+                continue
+
+            dedupeKey = BuildPracticeDedupeKey(card, bucket)
+            if dedupeKey in seenKeys:
+                continue
+            seenKeys.add(dedupeKey)
+
+            prompt = BuildPracticePrompt(card)
+            if not prompt:
+                continue
+            rows.append(
+                {
+                    "id": dedupeKey,
+                    "prompt": prompt,
+                    "hint": BuildPracticeHint(card),
+                    "expected": bucket,
+                }
+            )
+
+        random.shuffle(rows)
+        return rows
+
+    def _calculate_speed_bonus(self, elapsedSeconds: float) -> int:
+        if elapsedSeconds <= 2.0:
+            return 6
+        if elapsedSeconds <= 4.0:
+            return 4
+        if elapsedSeconds <= 6.0:
+            return 2
+        if elapsedSeconds <= 8.0:
+            return 1
+        return 0
 
     def _sync_defaults(self) -> None:
         collectionIds = [row["id"] for row in self.collection_options]
@@ -1150,6 +1486,30 @@ class AnkiAppState(rx.State):
             self.review_selected_card_ids = [
                 cardId for cardId in self.review_selected_card_ids if cardId in validCardIds
             ]
+
+        activePracticeDeckId = self._active_practice_deck_id()
+        if not activePracticeDeckId:
+            self.revision_card_index = 0
+            self.revision_show_back = False
+        else:
+            revisionCardsCount = len(GetDeckCards(GetConnection(), activePracticeDeckId))
+            if revisionCardsCount <= 0:
+                self.revision_card_index = 0
+                self.revision_show_back = False
+            else:
+                if self.revision_card_index < 0:
+                    self.revision_card_index = 0
+                if self.revision_card_index >= revisionCardsCount:
+                    self.revision_card_index = revisionCardsCount - 1
+
+        if self.practice_round_active and self.practice_round_deck_id not in deckIds:
+            self.practice_round_active = False
+            if self.practice_round_started_at > 0:
+                self.practice_round_elapsed_seconds = max(
+                    self.practice_round_elapsed_seconds,
+                    round(time.time() - self.practice_round_started_at, 2),
+                )
+
         self._sync_single_edit_card_form()
 
     def _get_selected_add_cards_entries(self) -> List[Dict[str, Any]]:
@@ -1353,15 +1713,12 @@ class AnkiAppState(rx.State):
     def select_global_destination_deck(self, deckId: str) -> None:
         self.global_destination_deck_id = deckId
         if deckId:
-            self.context_scope = "deck"
-            self.context_deck_id = deckId
-            self.cards_scope = "deck"
+            self.set_context_deck(deckId)
 
     def select_review_deck(self, deckId: str) -> None:
         self.review_deck_id = deckId
         if deckId:
-            self.context_scope = "deck"
-            self.context_deck_id = deckId
+            self.set_context_deck(deckId)
         self.review_selected_card_ids = []
         self.review_confirm_delete = False
         self._sync_single_edit_card_form()
@@ -1369,20 +1726,17 @@ class AnkiAppState(rx.State):
     def select_scan_deck(self, deckId: str) -> None:
         self.scan_deck_id = deckId
         if deckId:
-            self.context_scope = "deck"
-            self.context_deck_id = deckId
+            self.set_context_deck(deckId)
 
     def select_import_deck(self, deckId: str) -> None:
         self.import_deck_id = deckId
         if deckId:
-            self.context_scope = "deck"
-            self.context_deck_id = deckId
+            self.set_context_deck(deckId)
 
     def select_export_deck(self, deckId: str) -> None:
         self.export_deck_id = deckId
         if deckId:
-            self.context_scope = "deck"
-            self.context_deck_id = deckId
+            self.set_context_deck(deckId)
 
     def set_add_cards_destination(self, destination: str) -> None:
         self.add_cards_destination = "deck" if destination == "deck" else "global"
@@ -1451,6 +1805,171 @@ class AnkiAppState(rx.State):
             self.inline_add_deck_id = deckId
             self.custom_deck_id = deckId
             self.add_cards_deck_id = deckId
+            self.global_destination_deck_id = deckId
+            self.revision_card_index = 0
+            self.revision_show_back = False
+            if self.practice_round_active and self.practice_round_deck_id and self.practice_round_deck_id != deckId:
+                self.practice_round_active = False
+                if self.practice_round_started_at > 0:
+                    self.practice_round_elapsed_seconds = round(
+                        time.time() - self.practice_round_started_at,
+                        2,
+                    )
+                self.practice_last_result_message = "Round paused because context deck changed."
+
+    def reset_revision_session(self) -> None:
+        if not self._active_practice_deck_id():
+            self._set_status("warning", "Switch context to a deck to start revision mode.")
+            return
+        self.revision_card_index = 0
+        self.revision_show_back = False
+
+    def show_previous_revision_card(self) -> None:
+        cards = self.revision_card_rows
+        if not cards:
+            self._set_status("warning", "No cards available in the selected deck.")
+            return
+        self.revision_show_back = False
+        if self.revision_card_index <= 0:
+            self.revision_card_index = len(cards) - 1
+            return
+        self.revision_card_index -= 1
+
+    def show_next_revision_card(self) -> None:
+        cards = self.revision_card_rows
+        if not cards:
+            self._set_status("warning", "No cards available in the selected deck.")
+            return
+        self.revision_show_back = False
+        if self.revision_card_index >= len(cards) - 1:
+            self.revision_card_index = 0
+            return
+        self.revision_card_index += 1
+
+    def flip_revision_card(self) -> None:
+        if not self.revision_card_rows:
+            self._set_status("warning", "No cards available in the selected deck.")
+            return
+        self.revision_show_back = not self.revision_show_back
+
+    def set_practice_game_mode(self, mode: str) -> None:
+        if mode not in {"verb_sort", "adjective_sort"}:
+            return
+        self.practice_game_mode = mode
+
+    def start_practice_round(self) -> None:
+        deckId = self._active_practice_deck_id()
+        if not deckId:
+            self._set_status("warning", "Switch context to a deck to start the game.")
+            return
+
+        roundCards = self._build_practice_round_cards(deckId, self.practice_game_mode)
+        if not roundCards:
+            if self.practice_game_mode == "verb_sort":
+                self._set_status("warning", "No Ichidan/Godan verb cards found in this deck.")
+            else:
+                self._set_status("warning", "No い/な adjective cards found in this deck.")
+            return
+
+        now = time.time()
+        self.practice_round_active = True
+        self.practice_round_deck_id = deckId
+        self.practice_round_cards = roundCards
+        self.practice_round_index = 0
+        self.practice_round_started_at = now
+        self.practice_question_started_at = now
+        self.practice_round_elapsed_seconds = 0.0
+        self.practice_score = 0
+        self.practice_correct_count = 0
+        self.practice_incorrect_count = 0
+        self.practice_streak = 0
+        self.practice_best_streak = 0
+        self.practice_last_speed_bonus = 0
+        self.practice_last_result_message = ""
+        self.practice_answer_rows = []
+        self._set_status("info", f"Started {self.practice_mode_label} with {len(roundCards)} card(s).")
+
+    def stop_practice_round(self) -> None:
+        if not self.practice_round_active:
+            return
+        self.practice_round_active = False
+        if self.practice_round_started_at > 0:
+            self.practice_round_elapsed_seconds = round(time.time() - self.practice_round_started_at, 2)
+        self.practice_last_result_message = "Round stopped."
+
+    def _complete_practice_round(self) -> None:
+        self.practice_round_active = False
+        if self.practice_round_started_at > 0:
+            self.practice_round_elapsed_seconds = round(time.time() - self.practice_round_started_at, 2)
+        self.practice_last_result_message = "Round complete."
+        self._set_status(
+            "success",
+            (
+                f"Game complete. Score: {self.practice_score}. "
+                f"Correct: {self.practice_correct_count}, Incorrect: {self.practice_incorrect_count}, "
+                f"Best streak: {self.practice_best_streak}."
+            ),
+        )
+
+    def answer_practice_round(self, selectedBucket: str) -> None:
+        if not self.practice_round_active:
+            self._set_status("warning", "Start a game round first.")
+            return
+        if self.practice_round_index >= len(self.practice_round_cards):
+            self._complete_practice_round()
+            return
+
+        expectedBuckets = {"ichidan", "godan"} if self.practice_game_mode == "verb_sort" else {"i_adj", "na_adj"}
+        if selectedBucket not in expectedBuckets:
+            return
+
+        now = time.time()
+        currentCard = self.practice_round_cards[self.practice_round_index]
+        expectedBucket = str(currentCard.get("expected", "") or "")
+        elapsedSeconds = max(0.0, now - self.practice_question_started_at)
+        speedBonus = self._calculate_speed_bonus(elapsedSeconds)
+        wasCorrect = selectedBucket == expectedBucket
+        deltaPoints = 0
+
+        if wasCorrect:
+            self.practice_streak += 1
+            self.practice_best_streak = max(self.practice_best_streak, self.practice_streak)
+            streakBonus = min((self.practice_streak - 1) * 2, 12)
+            deltaPoints = PracticeBaseCorrectPoints + speedBonus + streakBonus
+            self.practice_score += deltaPoints
+            self.practice_correct_count += 1
+            self.practice_last_speed_bonus = speedBonus
+            self.practice_last_result_message = (
+                f"Correct. +{deltaPoints} points "
+                f"(speed +{speedBonus}, streak {self.practice_streak})."
+            )
+        else:
+            self.practice_streak = 0
+            deltaPoints = -PracticeIncorrectPenaltyPoints
+            self.practice_score = max(0, self.practice_score + deltaPoints)
+            self.practice_incorrect_count += 1
+            self.practice_last_speed_bonus = 0
+            self.practice_last_result_message = (
+                f"Incorrect. Expected {PracticeBucketLabels.get(expectedBucket, expectedBucket)}. "
+                f"{deltaPoints} points."
+            )
+
+        answerRow = {
+            "prompt": str(currentCard.get("prompt", "") or ""),
+            "hint": str(currentCard.get("hint", "") or ""),
+            "expected": expectedBucket,
+            "selected": selectedBucket,
+            "correct": wasCorrect,
+            "elapsed_seconds": round(elapsedSeconds, 2),
+            "delta_points": deltaPoints,
+        }
+        self.practice_answer_rows = [*self.practice_answer_rows, answerRow]
+
+        self.practice_round_index += 1
+        if self.practice_round_index >= len(self.practice_round_cards):
+            self._complete_practice_round()
+            return
+        self.practice_question_started_at = time.time()
 
     def use_context_for_add_cards_destination(self) -> None:
         if self.context_scope == "deck":
@@ -3781,6 +4300,7 @@ def cards_page() -> rx.Component:
             ),
             rx.box(
                 rx.vstack(
+                    revision_and_games_panel(),
                     section_box(
                         "Edit / Replace Media",
                         "Select one deck card to edit or replace media.",
@@ -3890,6 +4410,275 @@ def cards_page() -> rx.Component:
         ),
         spacing="3",
         width="100%",
+    )
+
+
+def revision_and_games_panel() -> rx.Component:
+    return section_box(
+        "Revision + Games",
+        "Flip through deck cards, then play timed sorting rounds with streak and speed bonuses.",
+        rx.hstack(
+            rx.text("Practice Deck:", color=ThemeStyles["MutedText"]),
+            rx.cond(
+                AnkiAppState.practice_target_deck_id != "",
+                rx.text(AnkiAppState.practice_target_deck_label),
+                rx.text("No deck selected"),
+            ),
+            width="100%",
+            wrap="wrap",
+            gap="8px",
+        ),
+        rx.cond(
+            AnkiAppState.context_scope == "global",
+            rx.button(
+                "Switch To Deck Context",
+                on_click=AnkiAppState.set_context_scope("deck"),
+                disabled=AnkiAppState.is_busy,
+                width="220px",
+            ),
+        ),
+        rx.box(height="1px", width="100%", background="#2a3b52"),
+        rx.text("Revision Mode", weight="bold"),
+        rx.cond(
+            AnkiAppState.has_revision_cards,
+            rx.box(
+                rx.vstack(
+                    rx.hstack(
+                        rx.text(AnkiAppState.revision_face_label, color=ThemeStyles["MutedText"], size="2"),
+                        rx.text(AnkiAppState.revision_progress_label, size="2"),
+                        width="100%",
+                        justify="between",
+                        align="center",
+                    ),
+                    rx.text(AnkiAppState.revision_face_text, size="5"),
+                    rx.text(AnkiAppState.revision_meta_text, size="2", color=ThemeStyles["MutedText"]),
+                    rx.cond(
+                        AnkiAppState.revision_show_back,
+                        rx.cond(
+                            AnkiAppState.revision_note_preview != "",
+                            rx.text(AnkiAppState.revision_note_preview, size="2", color=ThemeStyles["MutedText"]),
+                        ),
+                    ),
+                    spacing="2",
+                    align="stretch",
+                    width="100%",
+                ),
+                border="1px solid #2a3d53",
+                border_radius="8px",
+                background="#0f1723",
+                padding="12px",
+                width="100%",
+            ),
+            rx.text("No cards available in the selected deck."),
+        ),
+        rx.hstack(
+            rx.button(
+                "Restart",
+                on_click=AnkiAppState.reset_revision_session,
+                disabled=AnkiAppState.is_busy,
+                width="120px",
+            ),
+            rx.button(
+                "Previous",
+                on_click=AnkiAppState.show_previous_revision_card,
+                disabled=AnkiAppState.is_busy,
+                width="120px",
+            ),
+            rx.button(
+                rx.cond(AnkiAppState.revision_show_back, "Show Front", "Flip"),
+                on_click=AnkiAppState.flip_revision_card,
+                disabled=AnkiAppState.is_busy,
+                width="120px",
+            ),
+            rx.button(
+                "Next",
+                on_click=AnkiAppState.show_next_revision_card,
+                disabled=AnkiAppState.is_busy,
+                width="120px",
+            ),
+            width="100%",
+            wrap="wrap",
+            gap="8px",
+        ),
+        rx.box(height="1px", width="100%", background="#2a3b52"),
+        rx.text("Sorting Games", weight="bold"),
+        rx.flex(
+            *[
+                choice_button(
+                    option["label"],
+                    AnkiAppState.practice_game_mode == option["key"],
+                    AnkiAppState.set_practice_game_mode(option["key"]),
+                    AnkiAppState.is_busy,
+                )
+                for option in PracticeGameModeOptions
+            ],
+            wrap="wrap",
+            gap="8px",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.button(
+                rx.cond(AnkiAppState.practice_round_active, "Restart Round", "Start Round"),
+                on_click=AnkiAppState.start_practice_round,
+                disabled=AnkiAppState.is_busy,
+                width="160px",
+            ),
+            rx.cond(
+                AnkiAppState.practice_round_active,
+                rx.button(
+                    "Stop Round",
+                    on_click=AnkiAppState.stop_practice_round,
+                    disabled=AnkiAppState.is_busy,
+                    width="140px",
+                ),
+            ),
+            width="100%",
+            wrap="wrap",
+            gap="8px",
+        ),
+        rx.hstack(
+            rx.text("Score:"),
+            rx.text(AnkiAppState.practice_score),
+            rx.text("| Correct:"),
+            rx.text(AnkiAppState.practice_correct_count),
+            rx.text("| Incorrect:"),
+            rx.text(AnkiAppState.practice_incorrect_count),
+            rx.text("| Streak:"),
+            rx.text(AnkiAppState.practice_streak),
+            rx.text("(Best:"),
+            rx.text(AnkiAppState.practice_best_streak),
+            rx.text(")"),
+            width="100%",
+            wrap="wrap",
+            gap="6px",
+        ),
+        rx.hstack(
+            rx.text("Progress:", color=ThemeStyles["MutedText"], size="2"),
+            rx.text(AnkiAppState.practice_progress_label, size="2"),
+            width="100%",
+            wrap="wrap",
+            gap="6px",
+        ),
+        rx.cond(
+            AnkiAppState.has_active_practice_prompt,
+            rx.box(
+                rx.vstack(
+                    rx.text(AnkiAppState.practice_current_prompt, size="6"),
+                    rx.cond(
+                        AnkiAppState.practice_current_hint != "",
+                        rx.text(AnkiAppState.practice_current_hint, size="2", color=ThemeStyles["MutedText"]),
+                    ),
+                    spacing="2",
+                    align="start",
+                    width="100%",
+                ),
+                border="1px solid #2a3d53",
+                border_radius="8px",
+                background="#0f1723",
+                padding="12px",
+                width="100%",
+            ),
+            rx.text("Start a round to see the first card prompt.", size="2", color=ThemeStyles["MutedText"]),
+        ),
+        rx.cond(
+            AnkiAppState.has_active_practice_prompt,
+            rx.cond(
+                AnkiAppState.practice_game_mode == "verb_sort",
+                rx.hstack(
+                    rx.button(
+                        "Ichidan",
+                        on_click=AnkiAppState.answer_practice_round("ichidan"),
+                        disabled=AnkiAppState.is_busy,
+                        width="160px",
+                    ),
+                    rx.button(
+                        "Godan",
+                        on_click=AnkiAppState.answer_practice_round("godan"),
+                        disabled=AnkiAppState.is_busy,
+                        width="160px",
+                    ),
+                    width="100%",
+                    wrap="wrap",
+                    gap="8px",
+                ),
+                rx.hstack(
+                    rx.button(
+                        "I-adjective (い)",
+                        on_click=AnkiAppState.answer_practice_round("i_adj"),
+                        disabled=AnkiAppState.is_busy,
+                        width="170px",
+                    ),
+                    rx.button(
+                        "Na-adjective (な)",
+                        on_click=AnkiAppState.answer_practice_round("na_adj"),
+                        disabled=AnkiAppState.is_busy,
+                        width="170px",
+                    ),
+                    width="100%",
+                    wrap="wrap",
+                    gap="8px",
+                ),
+            ),
+        ),
+        rx.cond(
+            AnkiAppState.practice_last_result_message != "",
+            rx.text(AnkiAppState.practice_last_result_message, size="2"),
+        ),
+        rx.cond(
+            AnkiAppState.practice_summary_visible,
+            rx.box(
+                rx.vstack(
+                    rx.text("Round Summary", weight="bold"),
+                    rx.hstack(
+                        rx.text("Score:"),
+                        rx.text(AnkiAppState.practice_score),
+                        rx.text("| Accuracy:"),
+                        rx.text(AnkiAppState.practice_accuracy_percent),
+                        rx.text("%"),
+                        rx.text("| Avg time:"),
+                        rx.text(AnkiAppState.practice_average_seconds),
+                        rx.text("s"),
+                        rx.text("| Duration:"),
+                        rx.text(AnkiAppState.practice_round_elapsed_seconds),
+                        rx.text("s"),
+                        width="100%",
+                        wrap="wrap",
+                        gap="6px",
+                    ),
+                    rx.vstack(
+                        rx.foreach(
+                            AnkiAppState.practice_answer_result_rows,
+                            lambda row: rx.hstack(
+                                rx.text(row["prompt"], width="32%"),
+                                rx.text(row["selected_label"], width="16%"),
+                                rx.text(row["expected_label"], width="16%"),
+                                rx.text(
+                                    row["result_label"],
+                                    width="12%",
+                                    color=rx.cond(row["correct"], "#53b37c", "#f97066"),
+                                ),
+                                rx.text(row["elapsed_label"], width="12%", color=ThemeStyles["MutedText"]),
+                                rx.text(row["delta_label"], width="12%"),
+                                width="100%",
+                                border_bottom="1px solid #253447",
+                                padding_y="6px",
+                            ),
+                        ),
+                        align="stretch",
+                        spacing="0",
+                        width="100%",
+                    ),
+                    spacing="2",
+                    align="stretch",
+                    width="100%",
+                ),
+                border="1px solid #2a3d53",
+                border_radius="8px",
+                background="#0f1723",
+                padding="10px",
+                width="100%",
+            ),
+        ),
     )
 
 
