@@ -508,6 +508,10 @@ class AnkiAppState(rx.State):
             return "Current target: Global Pool"
         return f"Current target: {self.current_context_label}"
 
+    @rx.var
+    def has_context_deck(self) -> bool:
+        return bool(self.context_deck_id)
+
     @rx.var(cache=False)
     def collection_options(self) -> List[Dict[str, str]]:
         collections = ListCollections(GetConnection())
@@ -620,6 +624,36 @@ class AnkiAppState(rx.State):
     @rx.var
     def selected_inline_add_deck_label(self) -> str:
         return self._deck_label_by_id(self.inline_add_deck_id)
+
+    @rx.var
+    def dictionary_quick_add_button_label(self) -> str:
+        return f"Quick Add To {self.current_context_label}"
+
+    @rx.var
+    def add_cards_destination_label(self) -> str:
+        if self.add_cards_destination == "deck":
+            return self.selected_add_cards_deck_label or "Selected deck"
+        return "Global Pool"
+
+    @rx.var
+    def custom_destination_label(self) -> str:
+        if self.custom_destination == "deck":
+            return self.selected_custom_deck_label or "Selected deck"
+        return "Global Pool"
+
+    @rx.var
+    def inline_destination_label(self) -> str:
+        if self.inline_add_destination == "deck":
+            return self.selected_inline_add_deck_label or self.selected_context_deck_label or "Selected deck"
+        return "Global Pool"
+
+    @rx.var
+    def inline_save_button_label(self) -> str:
+        return f"Save To {self.inline_destination_label}"
+
+    @rx.var
+    def inline_save_continue_button_label(self) -> str:
+        return f"Save To {self.inline_destination_label} + Add Another"
 
     @rx.var
     def add_cards_result_rows(self) -> List[Dict[str, Any]]:
@@ -1309,12 +1343,19 @@ class AnkiAppState(rx.State):
 
     def select_add_cards_deck(self, deckId: str) -> None:
         self.add_cards_deck_id = deckId
+        if deckId:
+            self.add_cards_destination = "deck"
+            self.set_context_deck(deckId)
 
     def select_global_source_deck(self, deckId: str) -> None:
         self.global_source_deck_id = deckId
 
     def select_global_destination_deck(self, deckId: str) -> None:
         self.global_destination_deck_id = deckId
+        if deckId:
+            self.context_scope = "deck"
+            self.context_deck_id = deckId
+            self.cards_scope = "deck"
 
     def select_review_deck(self, deckId: str) -> None:
         self.review_deck_id = deckId
@@ -1344,7 +1385,12 @@ class AnkiAppState(rx.State):
             self.context_deck_id = deckId
 
     def set_add_cards_destination(self, destination: str) -> None:
-        self.add_cards_destination = destination
+        self.add_cards_destination = "deck" if destination == "deck" else "global"
+        if self.add_cards_destination == "deck":
+            if not self.add_cards_deck_id:
+                self.add_cards_deck_id = self.context_deck_id or (self.deck_options[0]["id"] if self.deck_options else "")
+            if self.add_cards_deck_id:
+                self.set_context_deck(self.add_cards_deck_id)
 
     def set_add_cards_schema_key(self, schemaKey: str) -> None:
         self.add_cards_schema_key = schemaKey
@@ -1353,7 +1399,12 @@ class AnkiAppState(rx.State):
         self.add_cards_word_form = wordForm
 
     def set_custom_destination(self, destination: str) -> None:
-        self.custom_destination = destination
+        self.custom_destination = "deck" if destination == "deck" else "global"
+        if self.custom_destination == "deck":
+            if not self.custom_deck_id:
+                self.custom_deck_id = self.context_deck_id or (self.deck_options[0]["id"] if self.deck_options else "")
+            if self.custom_deck_id:
+                self.set_context_deck(self.custom_deck_id)
 
     def set_custom_schema_key(self, schemaKey: str) -> None:
         self.custom_schema_key = schemaKey
@@ -1366,6 +1417,9 @@ class AnkiAppState(rx.State):
 
     def set_custom_deck(self, deckId: str) -> None:
         self.custom_deck_id = deckId
+        if deckId:
+            self.custom_destination = "deck"
+            self.set_context_deck(deckId)
 
     def set_cards_scope(self, scope: str) -> None:
         self.set_context_scope(scope)
@@ -1397,6 +1451,52 @@ class AnkiAppState(rx.State):
             self.inline_add_deck_id = deckId
             self.custom_deck_id = deckId
             self.add_cards_deck_id = deckId
+
+    def use_context_for_add_cards_destination(self) -> None:
+        if self.context_scope == "deck":
+            if not self.context_deck_id:
+                self._set_status("warning", "Select a context deck first.")
+                return
+            self.add_cards_destination = "deck"
+            self.add_cards_deck_id = self.context_deck_id
+            return
+        self.add_cards_destination = "global"
+
+    def use_context_for_custom_destination(self) -> None:
+        if self.context_scope == "deck":
+            if not self.context_deck_id:
+                self._set_status("warning", "Select a context deck first.")
+                return
+            self.custom_destination = "deck"
+            self.custom_deck_id = self.context_deck_id
+            return
+        self.custom_destination = "global"
+
+    def use_context_for_inline_destination(self) -> None:
+        if self.context_scope == "deck":
+            if not self.context_deck_id:
+                self._set_status("warning", "Select a context deck first.")
+                return
+            self.inline_add_destination = "deck"
+            self.inline_add_deck_id = self.context_deck_id
+            return
+        self.inline_add_destination = "global"
+
+    def use_context_for_global_import_destination(self) -> None:
+        if not self.context_deck_id:
+            self._set_status("warning", "Switch context to a deck to set a deck import destination.")
+            return
+        self.global_destination_deck_id = self.context_deck_id
+        self.context_scope = "deck"
+        self.cards_scope = "deck"
+        self._set_status("info", "Global import destination set to current context deck.")
+
+    def import_selected_global_cards_to_context_deck(self) -> None:
+        if not self.context_deck_id:
+            self._set_status("warning", "Switch context to a deck first.")
+            return
+        self.global_destination_deck_id = self.context_deck_id
+        self.import_selected_global_cards_to_deck()
 
     def set_selected_dictionary_entry(self, entryId: str) -> None:
         self.selected_dictionary_entry_id = entryId
@@ -1804,6 +1904,20 @@ class AnkiAppState(rx.State):
             return self.dictionary_results[0]
         return None
 
+    def quick_add_dictionary_entry_to_context(self, entryId: str) -> None:
+        if not entryId:
+            self._set_status("warning", "Select a dictionary entry first.")
+            return
+        self.selected_dictionary_entry_id = entryId
+        self.add_selected_dictionary_entry_to_context()
+
+    def open_inline_add_from_dictionary_entry(self, entryId: str) -> None:
+        if not entryId:
+            self._set_status("warning", "Select a dictionary entry first.")
+            return
+        self.selected_dictionary_entry_id = entryId
+        self.open_inline_add_from_selected_dictionary()
+
     def add_selected_dictionary_entry_to_global_pool(self) -> None:
         entry = self._get_selected_dictionary_entry_or_none()
         if not entry:
@@ -2119,7 +2233,7 @@ class AnkiAppState(rx.State):
                 videoAdapters.append(upload)
                 continue
 
-        mediaDeckId = "_global_pool" if self.custom_destination == "global" else (self.custom_deck_id or "_global_pool")
+        mediaDeckId = "_global_pool"
         savedImagePaths = [CopyUploadedMedia(upload, mediaDeckId) for upload in imageAdapters]
         savedVideoPaths = [CopyUploadedMedia(upload, mediaDeckId) for upload in videoAdapters]
 
@@ -2177,8 +2291,9 @@ class AnkiAppState(rx.State):
                 videoAdapters.append(upload)
                 continue
 
-        savedImagePaths = [CopyUploadedMedia(upload, "_global_pool") for upload in imageAdapters]
-        savedVideoPaths = [CopyUploadedMedia(upload, "_global_pool") for upload in videoAdapters]
+        mediaDeckId = self.custom_deck_id if self.custom_destination == "deck" else "_global_pool"
+        savedImagePaths = [CopyUploadedMedia(upload, mediaDeckId) for upload in imageAdapters]
+        savedVideoPaths = [CopyUploadedMedia(upload, mediaDeckId) for upload in videoAdapters]
         mediaFilesCombined = [*savedImagePaths, *savedVideoPaths]
         mediaType = "none"
         if savedImagePaths and not savedVideoPaths:
@@ -3049,6 +3164,29 @@ def dictionary_page() -> rx.Component:
                                                 row["pos_preview"] != "",
                                                 rx.text(row["pos_preview"], size="1", color=ThemeStyles["MutedText"]),
                                             ),
+                                            rx.hstack(
+                                                rx.button(
+                                                    rx.cond(row["selected"], "Viewing", "View"),
+                                                    on_click=AnkiAppState.set_selected_dictionary_entry(row["entry_id"]),
+                                                    disabled=AnkiAppState.is_busy,
+                                                    width="90px",
+                                                ),
+                                                rx.button(
+                                                    AnkiAppState.dictionary_quick_add_button_label,
+                                                    on_click=AnkiAppState.quick_add_dictionary_entry_to_context(row["entry_id"]),
+                                                    disabled=AnkiAppState.is_busy,
+                                                    width="220px",
+                                                ),
+                                                rx.button(
+                                                    "Customize",
+                                                    on_click=AnkiAppState.open_inline_add_from_dictionary_entry(row["entry_id"]),
+                                                    disabled=AnkiAppState.is_busy,
+                                                    width="120px",
+                                                ),
+                                                wrap="wrap",
+                                                gap="8px",
+                                                width="100%",
+                                            ),
                                             spacing="1",
                                             align="start",
                                             width="100%",
@@ -3058,8 +3196,6 @@ def dictionary_page() -> rx.Component:
                                         border="1px solid #2a3d53",
                                         background=rx.cond(row["selected"], "#22344b", "#121b29"),
                                         width="100%",
-                                        cursor="pointer",
-                                        on_click=AnkiAppState.set_selected_dictionary_entry(row["entry_id"]),
                                     ),
                                 ),
                                 spacing="2",
@@ -3185,22 +3321,59 @@ def dictionary_page() -> rx.Component:
                             ),
                             section_box(
                                 "Actions",
-                                "",
+                                "Use current context to add in one click, or choose explicit destination.",
+                                rx.hstack(
+                                    rx.text("Current add target:", color=ThemeStyles["MutedText"]),
+                                    rx.text(AnkiAppState.current_context_label),
+                                    width="100%",
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                rx.hstack(
+                                    choice_button(
+                                        "Global Pool",
+                                        AnkiAppState.context_scope == "global",
+                                        AnkiAppState.set_context_scope("global"),
+                                        AnkiAppState.is_busy,
+                                    ),
+                                    choice_button(
+                                        "Deck Context",
+                                        AnkiAppState.context_scope == "deck",
+                                        AnkiAppState.set_context_scope("deck"),
+                                        AnkiAppState.is_busy,
+                                    ),
+                                    width="100%",
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                rx.cond(
+                                    AnkiAppState.context_scope == "deck",
+                                    rx.hstack(
+                                        rx.text("Context deck:", color=ThemeStyles["MutedText"]),
+                                        rx.text(AnkiAppState.selected_context_deck_label),
+                                        width="100%",
+                                        wrap="wrap",
+                                        gap="8px",
+                                    ),
+                                ),
                                 rx.hstack(
                                     rx.button(
-                                        "Add To Current Context",
+                                        AnkiAppState.dictionary_quick_add_button_label,
                                         on_click=AnkiAppState.add_selected_dictionary_entry_to_context,
                                         disabled=AnkiAppState.is_busy,
+                                        width="300px",
                                     ),
                                     rx.button(
                                         "Add To Deck",
                                         on_click=AnkiAppState.add_selected_dictionary_entry_to_deck,
                                         disabled=AnkiAppState.is_busy,
+                                        width="140px",
                                     ),
                                     rx.button(
                                         "Add To Global Pool",
                                         on_click=AnkiAppState.add_selected_dictionary_entry_to_global_pool,
                                         disabled=AnkiAppState.is_busy,
+                                        width="170px",
                                     ),
                                     width="100%",
                                     wrap="wrap",
@@ -3451,6 +3624,51 @@ def cards_page() -> rx.Component:
                             width="100%",
                             wrap="wrap",
                             gap="8px",
+                        ),
+                        rx.box(
+                            rx.vstack(
+                                rx.text("Quick import target", weight="bold"),
+                                rx.cond(
+                                    AnkiAppState.context_scope == "deck",
+                                    rx.hstack(
+                                        rx.text("Current context deck:", color=ThemeStyles["MutedText"], size="2"),
+                                        rx.text(AnkiAppState.selected_context_deck_label, size="2"),
+                                        width="100%",
+                                        wrap="wrap",
+                                        gap="8px",
+                                    ),
+                                    rx.text(
+                                        "Switch context to Deck above to enable one-click import to your active deck.",
+                                        size="2",
+                                        color=ThemeStyles["MutedText"],
+                                    ),
+                                ),
+                                rx.hstack(
+                                    rx.button(
+                                        "Use current context deck",
+                                        on_click=AnkiAppState.use_context_for_global_import_destination,
+                                        disabled=AnkiAppState.is_busy,
+                                        width="220px",
+                                    ),
+                                    rx.button(
+                                        "Import selected to current context deck",
+                                        on_click=AnkiAppState.import_selected_global_cards_to_context_deck,
+                                        disabled=AnkiAppState.is_busy,
+                                        width="300px",
+                                    ),
+                                    width="100%",
+                                    wrap="wrap",
+                                    gap="8px",
+                                ),
+                                spacing="2",
+                                align="stretch",
+                                width="100%",
+                            ),
+                            border="1px solid #2a3d53",
+                            border_radius="8px",
+                            background="#0f1723",
+                            padding="10px",
+                            width="100%",
                         ),
                         deck_picker(
                             "Destination Deck for Selected Global Cards",
@@ -3720,6 +3938,19 @@ def add_cards_page() -> rx.Component:
         section_box(
             "Destination",
             "",
+            rx.hstack(
+                rx.text("Current context:", color=ThemeStyles["MutedText"]),
+                rx.text(AnkiAppState.current_context_label),
+                width="100%",
+                wrap="wrap",
+                gap="8px",
+            ),
+            rx.button(
+                "Use Current Context",
+                on_click=AnkiAppState.use_context_for_add_cards_destination,
+                disabled=AnkiAppState.is_busy,
+                width="200px",
+            ),
             rx.flex(
                 *[
                     choice_button(
@@ -3730,6 +3961,13 @@ def add_cards_page() -> rx.Component:
                     )
                     for option in AddDestinationOptions
                 ],
+                wrap="wrap",
+                gap="8px",
+            ),
+            rx.hstack(
+                rx.text("Selected destination:", color=ThemeStyles["MutedText"]),
+                rx.text(AnkiAppState.add_cards_destination_label),
+                width="100%",
                 wrap="wrap",
                 gap="8px",
             ),
@@ -3795,6 +4033,19 @@ def add_cards_page() -> rx.Component:
         section_box(
             "Add Custom Card",
             "Create custom cards for global pool or decks. Kanji field accepts plain kanji (example: 私).",
+            rx.hstack(
+                rx.text("Current context:", color=ThemeStyles["MutedText"]),
+                rx.text(AnkiAppState.current_context_label),
+                width="100%",
+                wrap="wrap",
+                gap="8px",
+            ),
+            rx.button(
+                "Use Current Context",
+                on_click=AnkiAppState.use_context_for_custom_destination,
+                disabled=AnkiAppState.is_busy,
+                width="200px",
+            ),
             rx.flex(
                 *[
                     choice_button(
@@ -3805,6 +4056,13 @@ def add_cards_page() -> rx.Component:
                     )
                     for option in AddDestinationOptions
                 ],
+                wrap="wrap",
+                gap="8px",
+            ),
+            rx.hstack(
+                rx.text("Selected destination:", color=ThemeStyles["MutedText"]),
+                rx.text(AnkiAppState.custom_destination_label),
+                width="100%",
                 wrap="wrap",
                 gap="8px",
             ),
@@ -4565,6 +4823,38 @@ def inline_add_drawer() -> rx.Component:
                         justify="between",
                     ),
                     rx.text("Inline card creation drawer. Fields are editable before saving.", size="2", color=ThemeStyles["MutedText"]),
+                    rx.box(
+                        rx.vstack(
+                            rx.hstack(
+                                rx.text("Current context:", color=ThemeStyles["MutedText"], size="2"),
+                                rx.text(AnkiAppState.current_context_label, size="2"),
+                                width="100%",
+                                wrap="wrap",
+                                gap="8px",
+                            ),
+                            rx.hstack(
+                                rx.text("Current destination:", color=ThemeStyles["MutedText"], size="2"),
+                                rx.text(AnkiAppState.inline_destination_label, size="2"),
+                                width="100%",
+                                wrap="wrap",
+                                gap="8px",
+                            ),
+                            rx.button(
+                                "Use Current Context",
+                                on_click=AnkiAppState.use_context_for_inline_destination,
+                                disabled=AnkiAppState.is_busy,
+                                width="180px",
+                            ),
+                            spacing="2",
+                            align="stretch",
+                            width="100%",
+                        ),
+                        border="1px solid #2a3d53",
+                        border_radius="8px",
+                        background="#0f1723",
+                        padding="10px",
+                        width="100%",
+                    ),
                     rx.flex(
                         *[
                             choice_button(
@@ -4750,22 +5040,24 @@ def inline_add_drawer() -> rx.Component:
                     ),
                     rx.hstack(
                         rx.button(
-                            "Save",
+                            AnkiAppState.inline_save_button_label,
                             on_click=lambda: AnkiAppState.save_inline_add_card(
                                 rx.upload_files(upload_id="inline_add_media_upload")
                             ),
                             disabled=AnkiAppState.is_busy,
-                            width="120px",
+                            width="250px",
                         ),
                         rx.button(
-                            "Save + Add Another",
+                            AnkiAppState.inline_save_continue_button_label,
                             on_click=lambda: AnkiAppState.save_inline_add_card_and_continue(
                                 rx.upload_files(upload_id="inline_add_media_upload")
                             ),
                             disabled=AnkiAppState.is_busy,
-                            width="180px",
+                            width="350px",
                         ),
                         width="100%",
+                        wrap="wrap",
+                        gap="8px",
                     ),
                     spacing="3",
                     align="stretch",
